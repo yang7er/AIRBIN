@@ -1,0 +1,753 @@
+---
+format: ipynb
+execute: 
+  eval: false
+---
+
+```{r}
+library("tidyverse")
+library("lubridate")
+library("magrittr")
+library("zoo")
+library("data.table")
+library("keras")
+library("tensorflow")
+library("RCurl")
+library("caret")
+library("reticulate")
+library("httr")
+library("jsonlite")
+reticulate::use_condaenv("monash")
+setwd("./Final Project")
+```
+
+## Data Pre-Preprocessing
+
+This part merges the AirBnB source data and downloads the public holiday data from the Victorian government API. As this part is based on external downloading providers with potentially variable links, we provide the final data as a zip file in the repository. The code is provided for completeness.
+
+```{r}
+## DO NOT RUN!
+
+# read in and combine "Inside AirBnB" data
+out_list <- rep_len(NA, 4) %>% as.list() %>% "names<-"(c("0922", "1222", "0323","0623"))
+for(suffix in c("0922", "1222", "0323","0623")){
+  listings <- read_csv(gzfile(paste0("listings_", suffix,".csv.gz")),
+                       show_col_types = FALSE)
+  calendar <- read_csv(gzfile(paste0("calendar_", suffix,".csv.gz")),
+                       show_col_types = FALSE)
+
+  out_list[[suffix]] <- listings %>%
+      select(id, beds) %>%
+      left_join(calendar %>% select(listing_id, date, price), by = c("id" = "listing_id"))
+}
+full_data <- rbindlist(out_list, idcol = "dataset")
+
+# reformat price and date
+full_data %<>%
+  mutate(price = price %>%
+            str_replace_all("\\$", "") %>%
+            str_replace_all(",", "") %>%
+            as.double(),
+         date = as_date(date)) %>% 
+  filter(date != max(full_data$date, na.rm = T)) 
+
+# focus on 4 and 6 bed listings
+full_data %>% write_csv(gzfile("full_data.csv.gz","wb"))
+```
+
+```{r}
+## DO NOT RUN!
+
+# Define the base URL
+base_url <- "https://wovg-community.gateway.prod.api.vic.gov.au/vicgov/v2.0/dates"
+
+# Initialize an empty list to store the results
+all_holidays <- list()
+
+# Define the start and end dates
+start_date <- as.Date("2022-01-01")
+end_date <- as.Date("2025-12-31")
+
+# Construct the URL for the current page
+url <- modify_url(
+  base_url,
+  query = list(
+    type = "PUBLIC_HOLIDAY,SCHOOL_TERM",
+    from_date = start_date,
+    to_date = end_date
+  )
+)
+
+# Make an HTTP GET request to the API
+source("components/apikey.R")
+response <- GET(url, add_headers(apikey = apikey))
+
+# Check if the response was successful
+if (http_status(response)$message == "Success: (200) OK") {
+  
+  # Parse the JSON response
+  holiday_data <- content(response)$dates
+
+  readr::write_csv(data.table::rbindlist(holiday_data), "public_holidays.csv")
+  
+} else {
+  # If the response is not successful, stop the loop
+  stop("Error: Unable to retrieve data from the API.")
+}
+```
+
+## Data Preprocessing
+
+```{r}
+# download and extract data
+download.file("https://api.onedrive.com/v1.0/shares/s!AjXuK6Vn5knCitJy_qjyBha8mNjyzQ/root/content", "data.zip")
+unzip("data.zip")
+full_data <- read_csv("full_data.csv")
+```
+
+```{r}
+# read in information on public holidays
+public_holidays <- read_csv("public_holidays.csv", show_col_types = FALSE) %>%
+  filter(type == "PUBLIC_HOLIDAY") %>%
+  summarise(date = ymd(date)) %>%
+  arrange(date) %>%
+  pull()
+```
+
+```{r}
+# read in information on school holidays
+school_holidays <- read_csv("public_holidays.csv", show_col_types = FALSE) %>%
+  filter(type == "SCHOOL_TERM") %>%
+  mutate(term = str_extract(name, "(?<=Term )[1-4]"),
+         year = str_extract(name, "\\d{4}"),
+         tmp = ifelse(str_detect(name, "Start"), "semester_start", "semester_end")) %>%
+  pivot_wider(names_from = tmp, values_from = date) %>%
+  group_by(term, year) %>%
+    summarise(across(c(semester_start, semester_end), ~ first(na.omit(.)))) %>%
+  ungroup() %>%
+  arrange(year, term) %>%
+  mutate(holiday_start = semester_end + 1,
+         holiday_end = lead(semester_start) - 1) %>% 
+  summarise(holidays = interval(holiday_start, holiday_end)) %>%
+  pull()
+```
+
+```{r}
+# create a function that performs feature creation, returning a data frame
+feature_creation <- function(data){
+
+  within_any <- function(date, intervals){
+      map(intervals, ~ date %within% .x)
+  }
+
+  # create several external variables of seasonality
+
+  data %<>%
+    group_by(date) %>%
+    summarise(mean_price = mean(price, na.rm = TRUE),
+              time = unique(as.double(date)),
+              year = unique(year(date)),
+              month = unique(month(date)),
+              day = unique(day(date)),
+              day_of_year = unique(yday(date)),
+              weekday = unique(wday(date))) %>%
+    # scale year and add linearly scaled time variable
+    mutate(month_scaled = (month - 1) / 11,
+           day_scaled = (day - 1) / 30,
+           weekday_scaled = (weekday - 1) / 6,
+           day_of_year_scaled = (day_of_year - 1) / 364,
+           year_scaled = (year - 2022) / (2025 - 2022),
+           time_scaled = (time - as.double(ymd("20241231"))) /
+                          (as.double(ymd("20241231")) - as.double(ymd("20220101"))))
+
+  # scaling output   
+  min_max_scale <- function(data, feature_range=c(0, 1)) {
+    min_val <- min(data, na.rm = TRUE)
+    max_val <- max(data, na.rm = TRUE)
+    
+    scale_min <- feature_range[1]
+    scale_max <- feature_range[2]
+    
+    scaled_data <- (data - min_val) / (max_val - min_val) * (scale_max - scale_min) + scale_min
+    list(scaled_data=scaled_data, min_val=min_val, max_val=max_val)
+    } 
+
+  # scale if not all zero (i.e. prediction of future prices)
+  if(!all(data$mean_price == 0)) data$mean_price <- min_max_scale(data$mean_price)[[1]]
+  
+  # adding holiday information to the data
+  data %<>%
+    ungroup() %>%
+    mutate(public_holiday = date %in% public_holidays,
+           public_holidays = lag(public_holiday, 1) | public_holiday | lead(public_holiday, 1),
+          school_holiday = map_dfc(school_holidays, ~ date %within% .x) %>% mutate(a = pmap(., any)) %>% pull("a") %>% as.logical(),
+          school_holiday = lag(school_holiday, 1) | school_holiday | lead(school_holiday, 1),
+          across(c(month, day, weekday), factor)) %>%
+    drop_na()
+
+  # first-order difference of lagged outcome at week level
+  #data %<>% 
+  #  mutate(across(mean_price, ~ .x - lag(.x, 7)))
+
+  # adding lagged outcomes in column
+  data <- bind_cols(
+    data, 
+      eval(parse(text = paste0("data %>% summarise(", paste("lag(mean_price,", 1:28, ")", collapse = ", ", sep = ""), ")"))))
+
+    # One-hot encoding for categorical variables like 'day_of_week' and 'month'
+  create_dummy_variables <- function(in_data, factor_col, levels) {
+      # Create an empty data frame to store dummy variables
+      dummy_df <- data.frame(matrix(0, nrow = nrow(in_data), ncol = length(levels) - 1))
+
+      # Set column names for the dummy variables
+      colnames(dummy_df) <- paste0(factor_col, tail(levels, -1))
+
+      # Fill in the dummy variables
+      for (i in 1:(length(levels) - 1)) {
+        dummy_df[, i] <- as.integer(in_data[[factor_col]] == levels[i + 1])
+      }
+
+      # Combine the original data with the dummy variables
+      in_data <- cbind(in_data, dummy_df)
+
+      # Remove the original factor variable
+      #in_data[[factor_col]] <- NULL
+
+      return(in_data)
+    }
+
+  data %<>% create_dummy_variables(., "day", 1:31)
+  data %<>% create_dummy_variables(., "weekday", 1:7)
+  data %<>% create_dummy_variables(., "month", 1:12)
+  #df %<>% create_dummy_variables(., "year", 2022:2024)
+  #df %<>% select(-date)
+
+  tibble(data)
+}
+```
+
+```{r}
+descale_prices <- function(prices, full_data){
+  # a function to reverse scaling
+  rev_min_max <- function(data, min_val, max_val){
+    data * (max_val - min_val) + min_val
+  }
+
+  # get the anchor values for reverse scaling
+  tmp <- full_data %>%
+    group_by(date) %>%
+    summarise(mean_price = mean(price), date = unique(date))
+  tmp_min <- tmp$mean_price %>% min(na.rm = T); tmp_max <- tmp$mean_price %>% max(na.rm = T)
+
+  rev_min_max(prices, tmp_min, tmp_max)
+}
+```
+
+```{r}
+# implement a time series split
+train_test_val_split <- function(data, k){
+  k <- k + 2
+  rows <- nrow(data)
+  split_size <- rows %/% k
+
+  indices <- matrix(NA, nrow = rows, ncol = 3)
+  for(i in 1:(k-2)){
+    indices[i,1] <- i * split_size
+    indices[i,2] <- (i + 1) * split_size
+    indices[i,3] <- (i + 2) * split_size
+    if(i+2==k){
+      indices[i,3] <- rows
+    }
+  }
+
+  map(1:(k-2), ~ list(data[1:indices[.x,1],], 
+                      data[(indices[.x,1] + 1):indices[.x,2],], 
+                      data[(indices[.x,2] + 1):indices[.x,3],]))
+}
+```
+
+```{r}
+# filter data, create lagged and calendar features, drop initial NAs
+analysis_data <- full_data %>% 
+  #filter(date < as_date("2023-10-01")) %>% 
+  feature_creation() %>%
+  drop_na()
+
+X_select <- analysis_data %>% 
+  select(public_holiday, school_holiday, time_scaled, year_scaled, day_of_year_scaled, weekday2:month12) %>% 
+  as.matrix() %>%
+  train_test_val_split(10)
+
+# get the lagged time series input, split and add dimension
+X_lagged <- analysis_data %>% 
+  select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
+  as.matrix() %>%
+  train_test_val_split(10) %>%
+  map(., ~ map(.x, ~ .x %>% `dim<-`(c(dim(.)[1], dim(.)[-1], 1))))
+
+# get the external input, split and add dimension
+X_external <- analysis_data %>% 
+  select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
+  as.matrix() %>%
+  train_test_val_split(10)
+
+# get the output data
+y <- analysis_data %>% 
+  select(mean_price) %>%
+  train_test_val_split(10) %>% 
+  map(., ~ map(.x, pull))
+```
+
+```{r}
+# a function to generate a sequence of dates
+generate_date_sequence <- function(start_date, end_date, interval) {
+  # Convert input strings to date objects
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+
+  # Create a sequence of dates
+  date_sequence <- seq(start_date, end_date, by = interval)
+
+  return(date_sequence)
+}
+
+# create a data frame with the dates for the prediction period
+raster_predict <- tibble(date = generate_date_sequence("2024-06-08", "2025-03-31", "1 day"), 
+                    price = 0) %>% 
+  feature_creation()
+
+X_select_predict <- raster_predict %>% 
+  select(public_holiday, school_holiday, time_scaled, year_scaled, day_of_year_scaled, weekday2:month12) %>% 
+  as.matrix()
+
+# get the lagged time series input, split and add dimension
+X_lagged_predict <- raster_predict %>% 
+  select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
+  as.matrix() %>% 
+  `dim<-`(c(dim(.)[1], dim(.)[-1], 1))
+
+# get the external input, split and add dimension
+X_external_predict <- raster_predict %>% 
+  select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
+  as.matrix()
+
+# get the output data
+y_predict <- raster_predict %>% 
+  select(mean_price) %>%
+  pull()
+```
+
+## Descriptives
+
+```{r}
+# plot mean daily price over time
+full_data %>%
+    feature_creation() %>%
+    ggplot(aes(x = date, y = mean_price)) +
+      geom_line() +
+      geom_vline(xintercept = public_holidays) +
+      geom_vline(xintercept = ymd(c("2023-03-17", "2023-06-11", "2022-09-13", "2022-12-16")), color = "red")
+```
+
+## Model utilities
+
+```{r}
+# a function implementing hyperparameter grid search
+grid_search <- function(X, y, model, hyperparameter_grid, k){
+  print("--- commencing hyperparameter search ---")
+  # prepare output grid
+  results <- as.list(rep_len(NA, nrow(hyperparameter_grid)))
+  # loop over hyperparameter grid
+  for(i in 1:nrow(hyperparameter_grid)){
+    print(paste0("*** hyperparameter search: ", i, " of ", nrow(hyperparameter_grid), " ***"))
+    # prepare list for results of k folds
+    results[[i]] <- as.list(rep_len(NA, k))
+    # loop over folds
+    for(j in 1:k){
+      print(paste0("~~~ fold: ", j, " of ", k, " ~~~"))
+      results[[i]][[j]] <- model(hyperparameter_grid[i,] %>% as.list()) %>% 
+      fit(
+        x = list(timeseries_input = X[[1]][[j]][[1]],
+                 external_input = X[[2]][[j]][[1]]),
+        y = y[[j]][[1]],,
+        epochs = 100,
+        batch_size = 32,
+        verbose = 0,
+        callbacks = list(
+          callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1),
+          callback_early_stopping(monitor = "val_loss", patience = 10)),
+        validation_data = list(X[[j]][[2]], y[[j]][[2]])
+      )
+    }
+  }
+  results
+}
+```
+
+```{r}
+final_fit <- function(X, y, hyperparameter_list, model){
+
+  mod <- model(hyperparameter_list)
+
+  history <- mod %>%
+    fit(
+      x = list(timeseries_input = tail(X[[1]], 1)[[1]][[1]], 
+               external_input = tail(X[[2]], 1)[[1]][[1]]),
+      y = tail(y, 1)[[1]][[1]],
+      epochs = 100,
+      batch_size = 32,
+      verbose = 0,
+      callbacks = list(
+        callback_model_checkpoint(filepath = "checkpoints.h5",
+                                  save_best_only = T, save_weights_only= T),
+        callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1),
+        callback_early_stopping(monitor = "val_loss", patience = 10)),
+      validation_data = list(list(timeseries_input = tail(X[[1]], 1)[[1]][[2]], 
+                                  external_input = tail(X[[2]], 1)[[1]][[2]]), 
+                             tail(y, 1)[[1]][[2]])
+    )
+    
+    plot(history)
+    
+    load_model_weights_tf(mod, "checkpoints.h5")
+    return(list(mod, history))
+}
+```
+
+```{r}
+final_predict <- function(mod, X, y, X_predict, raster_predict){
+  # initialize with last true values
+  X_predict[[1]][1,,] <- tail(tail(y)[[1]][[3]], 28)
+
+  for(i in 1:(nrow(X_lagged_predict) - 1)){
+    #
+    raster_predict$mean_price[[i]] <- mod %>% predict(list(X_predict[[1]][i,,,drop=F], X_predict[[2]][i,,drop=F]), verbose = 0)
+    #
+    X_predict[[1]][i+1,,] <- c(raster_predict$mean_price[[i]], X_predict[[1]][i,1:27,])
+  }
+
+  return(raster_predict)
+}
+```
+
+## A linear model
+
+```{r}
+linear_model <- lm(`...52` ~ ., data = bind_cols(X_select[[10]][[1]], y[[10]][[1]]) %>% mutate(across(c(public_holiday, school_holiday, day2:month12), as.factor)))
+
+test <- full_data %>% feature_creation() # %>% filter(date <= ymd("2023-09-01"))
+
+raster_predict <- tibble(date = generate_date_sequence("2023-09-01", "2025-01-31", "1 day"), 
+                    price = 0) %>% 
+    feature_creation()
+
+
+linear_model <- lm(mean_price ~ time_scaled + year + month + weekday + public_holiday + school_holiday, data = test)
+
+
+linear_model <- lm(mean_price ~ month_scaled + weekday_scaled + public_holiday + school_holiday, data = test)
+
+linear_model %>% summary()
+
+raster_predict$mean_price <- linear_model %>% 
+  predict(raster_predict) %>% as.double()
+
+visualize_data <-
+  bind_rows(analysis_data %>% add_column(type = "obs"),
+            raster_predict %>% add_column(type = "pred"))
+
+visualize_data %>%
+    ggplot(aes(x = date, y = mean_price, color = type)) +
+      geom_line()
+```
+
+## A neural network only using external features
+
+```{r}
+# a hyperparameter grid to test
+hyperparameter_grid <- expand_grid(
+  n_hidden_layers = c(1, 3),
+  input_vars = c(ncol(X_select[[1]][[1]])),
+  init_filters = c(32, 64),
+  filter_reduction_factor = c(1, 2),
+  lambda = c(1, .01, 0),
+  init_dropout = c(0.1, 0.2),
+  dropout_reduction_factor = c(1, 2),
+  learning_rate = c(0.1, 0.001, 0.00001),
+)
+
+# execute grid search, store results
+grid_results <- grid_search(X_external, y, model, hyperparameter_grid, 10)
+saveRDS(grid_results, file = "grid_search_external_model.rds")
+
+## evaluate results
+hyperparameter_grid$result <-
+  map_dbl(grid_results, ~ mean(map_dbl(., ~ min(.$metrics$loss))))
+
+# print results
+hyperparameter_grid[order(hyperparameter_grid$result),]
+
+# get best model
+best_model <- model(hyperparameter_grid[which.min(hyperparameter_grid$result),])
+```
+
+```{r}
+hyperparameter_grid <- expand_grid(
+  n_hidden_layers = c(3),
+  input_vars = c(ncol(X_select[[1]][[1]])),
+  init_filters = c(64),
+  filter_reduction_factor = c(2),
+  init_dropout = c(0.1),
+  dropout_reduction_factor = c(1),
+  learning_rate = c(0.001),
+  lambda = c(0.001)
+)
+
+mod <- model(hyperparameter_grid[1,] %>% as.list())
+
+history <- mod %>% 
+  fit(
+    x = tail(X_select, 1)[[1]][[1]],
+    y = tail(y, 1)[[1]][[1]],
+    epochs = 100,
+    batch_size = 32,
+    verbose = 0,
+    callbacks = list(callback_model_checkpoint(filepath = "checkpoints.h5",
+                                  save_best_only = T, save_weights_only= T),
+    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1)),
+    validation_data = list(tail(X_select, 1)[[1]][[2]], tail(y, 1)[[1]][[2]])
+  )
+
+plot(history)
+
+load_model_weights_tf(mod, "checkpoints.h5")
+```
+
+```{r}
+# predict new data
+raster_predict$mean_price <- mod %>% predict(X_select_predict) %>% as.double()
+
+raster_predict
+
+visualize_data <-
+  bind_rows(analysis_data %>% add_column(type = "obs"),
+            raster_predict %>% add_column(type = "pred"))
+
+visualize_data %>%
+    ggplot(aes(x = date, y = mean_price, color = type)) +
+      geom_line()
+```
+
+## A LSTM neural network using external features and lagged time series data
+
+```{r}
+source("components/lstmnet.R")
+lstmnet <- model
+```
+
+### Hyperparameter grid search
+
+```{r}
+hyperparameters_grid <- list(
+
+    # LSTM hyperparameters
+    lstm_filters = c(32, 64, 128, 256),             # Number of units/filters in the LSTM layer
+
+    # Dense layers for external features
+    n_hidden_layers = c(1, 2, 3),                   # Number of hidden layers for external features
+    init_filters = c(128, 256, 512),                # Number of neurons/filters in the first dense layer
+    filter_reduction_factor = c(2, 3),              # Reduction factor for neurons/filters in subsequent layers
+    init_dropout = c(0.1, 0.2, 0.3),                # Initial dropout rate
+    dropout_reduction_factor = c(1, 1.5, 2),        # Reduction factor for dropout in subsequent layers
+
+    # Regularization
+    regularize_lambda = c(0.001, 0.01, 0.1),        # L2 regularization factor for LSTM
+
+    # Model input parameters (fixed)
+    n_lags = c(28),                                 # Number of lagged time series data
+    n_external_features = c(50),                    # Number of external features
+
+    # Model compilation hyperparameters
+    learning_rate = c(0.001, 0.01, 0.1)             # Learning rate for optimizer
+)
+```
+
+```{r}
+# execute grid search, store results
+grid_results <- grid_search(X_external, y, lstmnet, hyperparameters_grid, 5)
+saveRDS(grid_results, file = "grid_search_external_model.rds")
+```
+
+### Single test
+
+```{r}
+hyperparameter_grid <- expand_grid(
+  n_lags = c(28),
+  n_external_features = c(ncol(X_external[[1]][[1]])),
+  n_hidden_layers = c(3),
+  lstm_filters = c(64),
+  regularize_lambda = c(0.001),
+  init_filters = c(32),
+  filter_reduction_factor = c(1),
+  init_dropout = c(.1),
+  dropout_reduction_factor = c(2),
+  learning_rate = c(0.001)
+)
+
+run <- final_fit(list(X_lagged, X_external), y, hyperparameter_grid[1,] %>% as.list(), lstmnet)
+
+plot(run[[2]])
+```
+
+```{r}
+raster_predict <- final_predict(run[[1]], list(X_lagged, X_external), y, 
+                                list(X_lagged_predict, X_external_predict), raster_predict)
+
+visualize_data <-
+  bind_rows(analysis_data %>% add_column(type = "obs"),
+            raster_predict %>% add_column(type = "pred"))
+visualize_data %>%
+    ggplot(aes(x = date, y = descale_prices(mean_price, full_data), color = type)) +
+      geom_line()
+```
+
+## A 1D-Convolutional Neural Network
+
+```{r}
+source("components/convnet.R")
+convnet <- model
+```
+
+### Hyperparameter grid search
+
+```{r}
+hyperparameters_grid <- list(
+
+    # 1D Convolution hyperparameters
+    conv_filters = c(16, 32, 64, 128),                 # Number of filters in the convolution
+    conv_kernel_size = c(2, 3, 4, 5),                  # Size of the convolution kernel
+    pool_size = c(2, 3, 4),                            # Max pooling size
+    conv_dense_units = c(32, 64, 128),                 # Dense layer size after 1D-Convolution 
+
+    # Dense layers for external features
+    n_hidden_layers = c(1, 2, 3),                      # Number of hidden layers for external features
+    init_filters = c(128, 256, 512),                   # Number of neurons/filters in the first dense layer
+    filter_reduction_factor = c(2, 3),                 # Reduction factor for neurons/filters in subsequent layers
+    init_dropout = c(0.1, 0.2, 0.3),                   # Initial dropout rate
+    dropout_reduction_factor = c(1, 1.5, 2),           # Reduction factor for dropout in subsequent layers
+
+    # Regularization
+    regularize_lambda = c(0.001, 0.01, 0.1),           # L2 regularization factor
+
+    # Model input parameters (fixed)
+    n_lags = c(28),                                 # Number of lagged time series data
+    n_external_features = c(50),                    # Number of external features
+
+    # Model compilation hyperparameters
+    learning_rate = c(0.001, 0.01, 0.1),               # Learning rate for optimizer
+
+)
+```
+
+```{r}
+# execute grid search, store results
+grid_results <- grid_search(X_external, y, convnet, hyperparameters_grid, 5)
+saveRDS(grid_results, file = "grid_search_external_model.rds")
+```
+
+### Single test
+
+```{r}
+hyperparameter_grid <- expand_grid(
+  n_lags = c(28),
+  n_external_features = c(ncol(X_external[[1]][[1]])),
+  #
+  conv_filters = c(64),
+  conv_kernel_size = c(7),
+  regularize_lambda = c(.001),
+  pool_size = c(2),
+  conv_dense_units = c(64),
+  #
+  n_hidden_layers = c(3),
+  init_filters = c(64),
+  filter_reduction_factor = c(2),
+  init_dropout = c(.3),
+  dropout_reduction_factor = c(2),
+  #
+  learning_rate = c(0.001)
+)
+
+run <- final_fit(list(X_lagged, X_external), y, hyperparameter_grid[1,] %>% as.list(), convnet)
+
+plot(run[[2]])
+```
+
+```{r}
+raster_predict <- final_predict(run[[1]], list(X_lagged, X_external), y, 
+                                list(X_lagged_predict, X_external_predict), raster_predict)
+
+visualize_data <-
+  bind_rows(analysis_data %>% add_column(type = "obs"),
+            raster_predict %>% add_column(type = "pred"))
+
+visualize_data %>%
+    ggplot(aes(x = date, y = descale_prices(mean_price, full_data), color = type)) +
+      geom_line()
+```
+
+# --- Deprecated stuff ---
+
+```{r}
+# a function to reverse scaling and first-differencing
+reverse_transform <- function(grid, full_data){
+  # a function to scale output   
+  min_max_scale <- function(data, min_val, max_val) {
+    (data - min_val) / (max_val - min_val)
+  } 
+
+  # a function to reverse scaling
+  rev_min_max <- function(data, min_val, max_val){
+    data * (max_val - min_val) + min_val
+  }
+
+  # get the anchor values for reverse scaling
+  tmp <- full_data %>%
+    group_by(date) %>%
+    summarise(mean_price = mean(price), date = unique(date))
+  tmp_min <- tmp$mean_price %>% min(na.rm = T); tmp_max <- tmp$mean_price %>% max(na.rm = T)
+
+  # get the anchor values for reverse first-differencing
+  anchor <- full_data %>% filter(date %within% interval(ymd("2024-06-04"), ymd("2024-06-10"))) %>% 
+    group_by(date) %>%
+    summarise(anchor = mean(price), date = unique(date + 7)) %>%
+    mutate(across(anchor, min_max_scale, min = tmp_min, max = tmp_max))
+
+  grid %>%
+    # add anchor values
+    full_join(anchor, by = "date") %>%
+    mutate(mean_price = ifelse(!is.na(anchor), mean_price + anchor, mean_price)) %>%
+    select(-anchor) %>%
+    # reverse first-differencing
+    group_by(wday(date)) %>%
+    mutate(mean_price = cumsum(mean_price)) %>%
+    ungroup() %>%
+        # reverse scaling
+    mutate(across(mean_price, rev_min_max, min = tmp_min, max = tmp_max))
+}
+```
+
+```r
+# filter to not include int_overlaps
+full_data %>% filter((dataset == "0922" & date <= "2022-12-16") | 
+                     (dataset == "1222" & date <= "2023-03-17") | 
+                     (dataset == "0323" & date <= "2023-06-11") |
+                     (dataset == "0723"))
+```
+
+
+TODO:
+
+- category
+
+- find sources
+- write essay
