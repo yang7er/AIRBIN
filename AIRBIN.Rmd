@@ -1,6 +1,6 @@
 ---
 title: "AIRBIN Forecasting"
-author: "Jingyi Shi"
+author: "Felix / Jingyi Shi"
 date: "2023-09-21"
 output: html_document
 ---
@@ -9,4 +9,282 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+
+```{r}
+library("tidyverse")
+library("lubridate")
+library("magrittr")
+library("data.table")
+library("keras")
+library("tensorflow")
+library("RCurl")
+library("caret")
+library("fpp3")
+library(prophet)
+theme_set(theme_minimal())
+```
+
+
+# Import data
+
+```{r}
+download.file("https://api.onedrive.com/v1.0/shares/s!AjXuK6Vn5knCis9YKZiDH9ByZHLEQg/root/content", "data.zip")
+unzip("data.zip")
+```
+
+## data clean
+
+```{r}
+# read in and combine "Inside AirBnB" data
+out_list <- rep_len(NA, 4) %>% as.list() %>% "names<-"(c("0922", "1222", "0323","0723"))
+for(suffix in c("0922", "1222", "0323","0723")){
+  listings <- read_csv(gzfile(paste0("listings_", suffix,".csv.gz")),
+                       show_col_types = FALSE)
+  calendar <- read_csv(gzfile(paste0("calendar_", suffix,".csv.gz")),
+                       show_col_types = FALSE)
+
+  out_list[[suffix]] <- listings %>%
+      select(id, name, description,beds, latitude, longitude) %>%
+      left_join(calendar, by = c("id" = "listing_id"))
+}
+full_data <- rbindlist(out_list)
+```
+
+```{r}
+# reformat price and date
+full_data %<>%
+  mutate(price = price %>%
+            str_replace_all("\\$", "") %>%
+            str_replace_all(",", "") %>%
+            as.double(),
+         date = as_date(date))
+```
+
+## set 4/6 rooms
+
+```{r}
+full_data <- full_data %>% 
+  select(date,price,beds) %>% 
+  filter(beds %in% c(4,6)) %>% 
+  select(-beds) %>% 
+  group_by(date) %>% 
+  summarise(price = mean(price,na.rm = TRUE))
+
+```
+
+# These are the processes by which I found out that arima and ets don't work well and can be used without run
+
+-------------------------------------------------------------------
+
+# Time series forecasting
+
+## Plot time series
+
+### plot it
+
+```{r}
+# as_tsibble() for regular room
+full_data <-
+  full_data[!is.na(full_data$date) & !is.na(full_data$price),]
+
+full_data %>% 
+  filter(date <= "2024-04-10") %>% 
+  as_tsibble(index = date) %>% 
+  left_join(summer_data) -> regular
+
+regular %>%
+  autoplot()
+```
+
+
+# Regular forcasting 
+
+## ARIMA
+
+```{r}
+regular %>% 
+  gg_tsdisplay(difference(price, 12),
+               plot_type='partial', lag = 36)
+```
+
+```{r}
+arima_regular <- regular |>
+  model(
+   auto = ARIMA(price ~ summer))
+```
+
+```{r}
+arima_regular |> gg_tsresiduals()
+```
+
+
+```{r}
+future_data <- data.frame(
+  date = seq.Date(from = as.Date("2024-04-11"), 
+                  by = "1 day", 
+                  length.out = 365)) %>%
+  mutate(
+    summer = case_when(
+      date >= as.Date("2024-12-01") & date <= as.Date("2025-02-28") ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    public_holiday = case_when(
+      date %in% c("2024-09-23","2024-11-01","2024-12-24","2024-12-25","2024-12-26","2024-12-27") ~ TRUE,
+      TRUE~FALSE
+    )
+  )
+
+future_ts <- future_data %>%
+  as_tsibble(index = date, key = NULL)
+
+arimax_forecast <- forecast(arima_regular,new_data =future_ts)
+
+arimax_forecast %>% 
+  autoplot(regular)
+
+```
+
+## ETS
+
+```{r}
+ets_regular <-regular |>
+  model(auto = ETS(price ~ error('M')+trend('A')+season('A'))
+)
+```
+
+```{r}
+ets_regular |> gg_tsresiduals()
+```
+
+
+
+```{r}
+ets_forecast <- forecast(ets_regular,new_data =future_ts)
+
+ets_forecast %>% 
+  autoplot(regular)
+```
+
+
+
+-------------------------------------------------------------------
+
+# Begin to run code：
+
+# Using Prophet
+
+## Regular forecasting
+
+```{r}
+full_data %>% 
+  rename("ds" = "date",
+         "y" = "price") %>% 
+    filter(ds <= "2023-09-30") %>%  
+  as.data.frame() -> data_4
+```
+
+### Add holidays
+
+```{r}
+holidays <- read_csv("holidays.csv")
+```
+### Set model
+
+```{r}
+# set the prophet model
+prophet_regular <- prophet::prophet(
+  df = data_4,
+  growth = "linear",
+  n.changepoints = 35,
+  changepoint.range = 0.8,
+  yearly.seasonality = "TRUE",
+  weekly.seasonality = "TRUE",
+  seasonality.mode = "additive",
+  seasonality.prior.scale = 10,
+  holidays = holidays,
+  holidays.prior.scale = 10,
+  changepoint.prior.scale = 0.05,
+  mcmc.samples = 0,
+  interval.width = 0.8,
+  uncertainty.samples = 1000,
+  fit = TRUE
+)
+```
+
+### Forecasting
+
+```{r}
+# set future data
+future <- make_future_dataframe(prophet_regular, periods = 365)
+
+# forecast
+forecast <- predict(prophet_regular, future)
+```
+
+### Plot
+
+#### trend components
+
+```{r}
+# trend components
+prophet_plot_components(prophet_regular, forecast)
+
+```
+
+
+
+```{r}
+# plot it
+plot(prophet_regular, forecast)
+```
+
+```{r}
+dyplot.prophet(prophet_regular, forecast)
+```
+
+
+
+```{r}
+# cross_validation
+cross_validation(
+  prophet_regular,horizon = 10, units = "days") -> cv_fc
+
+# summarise rmes
+metrics <- performance_metrics(cv_fc)
+
+# RMSE
+metrics$rmse
+```
+
+```{r}
+data.frame(forecast$ds,forecast$yhat) %>% 
+  rename("date" = "forecast.ds",
+         "price_forecast"= "forecast.yhat")-> forecast_data
+```
+
+
+```{r}
+forecast_data %>% 
+  filter(date <= "2024-06-11") %>% 
+  cbind(full_data) %>% 
+  select(-3) %>% 
+  mutate(error = price_forecast - price) -> new_data
+
+# RMSE by hand
+forecast_data %>% 
+  filter(date <= "2024-06-11") %>% 
+  cbind(full_data) %>% 
+  select(-3) %>% 
+  summarise(rmse = sqrt(sum((price_forecast - price)^2)/637))
+```
+
+```{r}
+forecast_data %>% 
+  ggplot(aes(x = date, y = price_forecast)) + 
+  geom_line(color = "blue") -> p1
+
+p1 +
+  geom_line(data = new_data,
+            aes(x = date,y =price,color = "pink"))
+```
 
