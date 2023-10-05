@@ -18,6 +18,8 @@ library("reticulate")
 library("httr")
 library("jsonlite")
 reticulate::use_condaenv("stat_ml")
+reticulate::py_run_string("import tensorflow as tf")
+reticulate::py_run_string("tf.random.set_seed(1)")
 ```
 
 ## Data Pre-Preprocessing
@@ -25,6 +27,7 @@ reticulate::use_condaenv("stat_ml")
 This part merges the AirBnB source data and downloads the public holiday data from the Victorian government API. As this part is based on external downloading providers with potentially variable links, we provide the final data as a zip file in the repository. The code is provided for completeness.
 
 ```{r}
+#| eval: false
 ## DO NOT RUN!
 
 # read in and combine "Inside AirBnB" data
@@ -55,6 +58,7 @@ full_data %>% write_csv(gzfile("full_data.csv.gz","wb"))
 ```
 
 ```{r}
+#| eval: false
 ## DO NOT RUN!
 
 # Define the base URL
@@ -137,7 +141,7 @@ feature_creation <- function(data){
 
   # create a mean price variable
   data %<>%
-    group_by(beds = (beds == 4) * 1, date) %>%
+    group_by(date) %>%
     summarize(mean_price = mean(price, na.rm = TRUE))
 
   # scaling output   
@@ -274,14 +278,7 @@ analysis_data <- full_data %>%
   drop_na()
 
 # get the lagged time series input, split and add dimension
-X_lagged_4 <- analysis_data %>% 
-  filter(beds == 0) %>%
-  select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
-  as.matrix() %>%
-  train_test_val_split(k_folds) %>%
-  map(., ~ map(.x, ~ .x %>% `dim<-`(c(dim(.)[1], dim(.)[-1], 1))))
-X_lagged_6 <- analysis_data %>% 
-  filter(beds == 1) %>%
+X_lagged <- analysis_data %>% 
   select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
   as.matrix() %>%
   train_test_val_split(k_folds) %>%
@@ -289,34 +286,15 @@ X_lagged_6 <- analysis_data %>%
 
 # get the external input, split and add dimension
 X_external <- analysis_data %>% 
-  filter(beds == 0) %>%
   select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
   as.matrix() %>%
   train_test_val_split(k_folds)
 
 # get the output data
-y_4 <- analysis_data %>% 
-  filter(beds == 0) %>%
+y <- analysis_data %>% 
   select(mean_price) %>%
   train_test_val_split(k_folds) %>% 
   map(., ~ map(.x, pull))
-y_6 <- analysis_data %>% 
-  filter(beds == 1) %>%
-  select(mean_price) %>%
-  train_test_val_split(k_folds) %>% 
-  map(., ~ map(.x, pull))
-```
-
-## Descriptives
-
-```{r}
-# plot mean daily price over time
-full_data %>%
-    feature_creation() %>%
-    ggplot(aes(x = date, y = mean_price)) +
-      geom_line() +
-      geom_vline(xintercept = public_holidays) +
-      geom_vline(xintercept = ymd(c("2023-03-17", "2023-06-11", "2022-09-13", "2022-12-16")), color = "red")
 ```
 
 ## Model utilities
@@ -324,20 +302,28 @@ full_data %>%
 ```{r}
 # a function implementing hyperparameter grid search
 grid_search <- function(X, y, model, hyperparameter_grid, k){
-  hyperparameter_grid <- expand.grid(hyperparameter_grid)
+  if(file.exists("grid_search/hyperparameter_grid.csv")){
+    hyperparameter_grid <- read_csv("grid_search/hyperparameter_grid.csv")
+    start <- nrow(hyperparameter_grid %>% drop_na()) + 1
+  } else {
+    hyperparameter_grid <- expand.grid(hyperparameter_grid)
+    hyperparameter_grid %<>% add_column(score_1 = NA, score_2 = NA, score_3 = NA)
+    start <- 1
+  }
+
   print("--- commencing hyperparameter search ---")
   # prepare output grid
-  results <- as.list(rep_len(NA, 10))
+  #results <- as.list(rep_len(NA, 10))
   # loop over hyperparameter grid
-  for(i in 1:nrow(hyperparameter_grid)){
+  for(i in start:nrow(hyperparameter_grid)){
     print(paste0("*** hyperparameter search: ", i, " of ", nrow(hyperparameter_grid), " ***"))
     # prepare list for results of k folds
-    results[[i%%(10 + 1)]] <- as.list(rep_len(NA, k))
+    #results[[((i-1)%%10+1)]] <- as.list(rep_len(NA, k))
     # loop over folds
     for(j in 1:k){
       print(paste0("~~~ fold: ", j, " of ", k, " ~~~"))
-      results[[i%%(10 + 1)]][[j]] <- model(hyperparameter_grid[i,] %>% as.list()) %>% 
-      fit(
+      mod <- model(hyperparameter_grid[i,] %>% as.list()) 
+      mod %>% fit(
         x = list(timeseries_input = X[[1]][[j]][[1]],
                  external_input = X[[2]][[j]][[1]]),
         y = y[[j]][[1]],
@@ -345,25 +331,34 @@ grid_search <- function(X, y, model, hyperparameter_grid, k){
         batch_size = 32,
         verbose = 0,
         callbacks = list(
-          callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1),
-          callback_early_stopping(monitor = "val_loss", patience = 10)),
+          callback_model_checkpoint(filepath = "checkpoints_grid_search.h5",
+                                    save_best_only = T, save_weights_only= T),
+          callback_reduce_lr_on_plateau(monitor = "val_loss", patience = 10, factor = 0.1),
+          callback_early_stopping(monitor = "val_loss", patience = 15)),
         validation_data = list(list(timeseries_input = X[[1]][[j]][[2]],
                                     external_input = X[[2]][[j]][[2]]), 
                                y[[j]][[2]])
       )
+      #results[[((i-1)%%10+1)]][[j]] <- 
+      load_model_weights_tf(mod, "checkpoints_grid_search.h5")
+      hyperparameter_grid[i,paste0("score_",j)] <- 
+        evaluate(mod, list(timeseries_input = X[[1]][[j]][[3]],
+                           external_input = X[[2]][[j]][[3]]), 
+                     y[[j]][[3]], verbose = 0)
       
     }
     # store results every 10 iterations
-    if(i%%10==0){
-      saveRDS(results, file = paste0("grid_search/grid_search_lstmnet_", (i%/%10),".rds"))
-      results <- as.list(rep_len(NA, 10))
+    if(((i-1)%%10)==0){
+      hyperparameter_grid %>% write_csv("grid_search/hyperparameter_grid.csv")
+      #saveRDS(results, file = paste0("grid_search/grid_search_lstmnet_", (i%/%10),".rds"))
+      #results <- as.list(rep_len(NA, 10))
     }
   }
 }
 ```
 
 ```{r}
-final_fit <- function(X, y, hyperparameter_list, model){
+final_fit <- function(X, y, hyperparameter_list, model, model_name){
 
   mod <- model(hyperparameter_list)
 
@@ -376,24 +371,23 @@ final_fit <- function(X, y, hyperparameter_list, model){
       batch_size = 32,
       verbose = 0,
       callbacks = list(
-        callback_model_checkpoint(filepath = "checkpoints.h5",
-                                  save_best_only = T, save_weights_only= T),
-        callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1),
-        callback_early_stopping(monitor = "val_loss", patience = 10)),
+        callback_model_checkpoint(filepath = paste0("checkpoints_", model_name, ".h5"),
+                                  save_best_only = T, save_weights_only= F),
+        callback_reduce_lr_on_plateau(monitor = "val_loss",
+        patience = 5, factor = 0.1),
+        callback_early_stopping(monitor = "val_loss", patience = 15)),
       validation_data = list(list(timeseries_input = tail(X[[1]], 1)[[1]][[2]], 
                                   external_input = tail(X[[2]], 1)[[1]][[2]]), 
                              tail(y, 1)[[1]][[2]])
     )
     
-    plot(history)
-    
-    load_model_weights_tf(mod, "checkpoints.h5")
+    load_model_weights_tf(mod, paste0("checkpoints_", model_name, ".h5"))
     return(list(mod, history))
 }
 ```
 
 ```{r}
-final_predict <- function(mod, analysis_data, start_date = "2023-10-01", end_date = "2024-09-30"){
+final_predict <- function(mod, analysis_data, start_date = "2023-10-01", end_date = "2024-06-30"){
 
   # a function to generate a sequence of dates
   generate_date_sequence <- function(start_date, end_date, interval) {
@@ -409,154 +403,40 @@ final_predict <- function(mod, analysis_data, start_date = "2023-10-01", end_dat
 
   # create a data frame with the dates for the prediction period
   raster_predict <- expand_grid(date = generate_date_sequence(start_date, end_date, "1 day"), 
-                                price = 0,
-                                beds = c(4, 6)) %>% 
+                                price = 0) %>% 
     feature_creation()
 
-  out <- as.list(rep_len(NA, 2))
-  for(n_beds in 0:1){
-    # get the lagged time series input, split and add dimension
-    X_lagged_predict <- raster_predict %>% 
-      filter(beds == n_beds) %>%
-      select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
-      as.matrix() %>% 
-      `dim<-`(c(dim(.)[1], dim(.)[-1], 1))
-    X_lagged_predict[1,,] <- analysis_data %>% 
-      filter(beds == n_beds, date == (ymd(start_date) - 1)) %>%
-      select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>%
-      as.matrix()
 
-    # get the external input, split and add dimension
-    X_external_predict <- raster_predict %>% 
-      filter(beds == n_beds) %>% 
-      select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
-      as.matrix()
+  # get the lagged time series input, split and add dimension
+  X_lagged_predict <- raster_predict %>% 
+    select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
+    as.matrix() %>% 
+    `dim<-`(c(dim(.)[1], dim(.)[-1], 1))
+  X_lagged_predict[1,,] <- analysis_data %>% 
+    filter(date == (ymd(start_date) - 1)) %>%
+    select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>%
+    as.matrix()
 
-    X_predict <- list(X_lagged_predict, X_external_predict)
+  # get the external input, split and add dimension
+  X_external_predict <- raster_predict %>% 
+    select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
+    as.matrix()
 
-    # get the output data
-    y_predict <- raster_predict %>% 
-      filter(beds == n_beds) %>% 
-      select(date, beds, mean_price)
+  X_predict <- list(X_lagged_predict, X_external_predict)
 
-    for(i in 1:(nrow(X_predict[[1]]) - 1)){
-      #
-      y_predict$mean_price[[i]] <- mod[[(n_beds + 1)]] %>% predict(list(X_predict[[1]][i,,,drop=F], X_predict[[2]][i,,drop=F]), verbose = 0)
-      #
-      X_predict[[1]][i+1,,] <- c(y_predict$mean_price[[i]], X_predict[[1]][i,1:27,])
-    }
-    out[[n_beds + 1]] <- y_predict
+  # get the output data
+  y_predict <- raster_predict %>% 
+    select(date, mean_price)
+
+  for(i in 1:(nrow(X_predict[[1]]) - 1)){
+    #
+    y_predict$mean_price[[i]] <- mod %>% predict(list(X_predict[[1]][i,,,drop=F], X_predict[[2]][i,,drop=F]), verbose = 0)
+    #
+    X_predict[[1]][i+1,,] <- c(y_predict$mean_price[[i]], X_predict[[1]][i,1:27,])
   }
-  return(rbindlist(out))
+
+  y_predict
 }
-```
-
-## A linear model
-
-```{r}
-linear_model <- lm(`...52` ~ ., data = bind_cols(X_select[[10]][[1]], y[[10]][[1]]) %>% mutate(across(c(public_holiday, school_holiday, day2:month12), as.factor)))
-
-test <- full_data %>% feature_creation() # %>% filter(date <= ymd("2023-09-01"))
-
-raster_predict <- tibble(date = generate_date_sequence("2023-09-01", "2025-01-31", "1 day"), 
-                    price = 0) %>% 
-    feature_creation()
-
-
-linear_model <- lm(mean_price ~ time_scaled + year + month + weekday + public_holiday + school_holiday, data = test)
-
-
-linear_model <- lm(mean_price ~ month_scaled + weekday_scaled + public_holiday + school_holiday, data = test)
-
-linear_model %>% summary()
-
-raster_predict$mean_price <- linear_model %>% 
-  predict(raster_predict) %>% as.double()
-
-visualize_data <-
-  bind_rows(analysis_data %>% add_column(type = "obs"),
-            raster_predict %>% add_column(type = "pred"))
-
-visualize_data %>%
-    ggplot(aes(x = date, y = mean_price, color = type)) +
-      geom_line()
-```
-
-## A neural network only using external features
-
-```{r}
-# a hyperparameter grid to test
-hyperparameter_grid <- expand_grid(
-  n_hidden_layers = c(1, 3),
-  input_vars = c(ncol(X_select[[1]][[1]])),
-  init_filters = c(32, 64),
-  filter_reduction_factor = c(1, 2),
-  lambda = c(1, .01, 0),
-  init_dropout = c(0.1, 0.2),
-  dropout_reduction_factor = c(1, 2),
-  learning_rate = c(0.1, 0.001, 0.00001),
-)
-
-# execute grid search, store results
-grid_results <- grid_search(X_external, y, model, hyperparameter_grid, 10)
-saveRDS(grid_results, file = "grid_search_external_model.rds")
-
-## evaluate results
-hyperparameter_grid$result <-
-  map_dbl(grid_results, ~ mean(map_dbl(., ~ min(.$metrics$loss))))
-
-# print results
-hyperparameter_grid[order(hyperparameter_grid$result),]
-
-# get best model
-best_model <- model(hyperparameter_grid[which.min(hyperparameter_grid$result),])
-```
-
-```{r}
-hyperparameter_grid <- expand_grid(
-  n_hidden_layers = c(3),
-  input_vars = c(ncol(X_select[[1]][[1]])),
-  init_filters = c(64),
-  filter_reduction_factor = c(2),
-  init_dropout = c(0.1),
-  dropout_reduction_factor = c(1),
-  learning_rate = c(0.001),
-  lambda = c(0.001)
-)
-
-mod <- model(hyperparameter_grid[1,] %>% as.list())
-
-history <- mod %>% 
-  fit(
-    x = tail(X_select, 1)[[1]][[1]],
-    y = tail(y, 1)[[1]][[1]],
-    epochs = 100,
-    batch_size = 32,
-    verbose = 0,
-    callbacks = list(callback_model_checkpoint(filepath = "checkpoints.h5",
-                                  save_best_only = T, save_weights_only= T),
-    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1)),
-    validation_data = list(tail(X_select, 1)[[1]][[2]], tail(y, 1)[[1]][[2]])
-  )
-
-plot(history)
-
-load_model_weights_tf(mod, "checkpoints.h5")
-```
-
-```{r}
-# predict new data
-raster_predict$mean_price <- mod %>% predict(X_select_predict) %>% as.double()
-
-raster_predict
-
-visualize_data <-
-  bind_rows(analysis_data %>% add_column(type = "obs"),
-            raster_predict %>% add_column(type = "pred"))
-
-visualize_data %>%
-    ggplot(aes(x = date, y = mean_price, color = type)) +
-      geom_line()
 ```
 
 ## A LSTM neural network using external features and lagged time series data
@@ -578,7 +458,7 @@ hyperparameters_grid <- list(
     n_hidden_layers = c(1, 3),                   # Number of hidden layers for external features
     init_filters = c(128, 512),                # Number of neurons/filters in the first dense layer
     filter_reduction_factor = c(2, 3),              # Reduction factor for neurons/filters in subsequent layers
-    init_dropout = c(0.1, 0.3),                # Initial dropout rate
+    init_dropout = c(0.1, 0.2),                # Initial dropout rate
     dropout_reduction_factor = c(1, 2),        # Reduction factor for dropout in subsequent layers
 
     # Regularization
@@ -594,40 +474,63 @@ hyperparameters_grid <- list(
 ```
 
 ```{r}
+#| eval: false
 # execute grid search, store results
 grid_search(list(X_lagged, X_external), y, lstmnet, hyperparameters_grid, k_folds)
 ```
 
-### Single test
+```{r}
+#| eval: false
+# get best hyperparameters from grid search result
+best_hyperparameters <- read_csv("grid_search/hyperparameter_grid_lstmnet.csv") %>%
+  drop_na() %>% 
+  mutate(result = score_1 + score_2 + score_3 * 1/3) %>%
+  #pull(result) %>% which.min()
+  arrange(result) %>%
+  head(1) %>%
+  as.list()
+```
+
+### Final model
 
 ```{r}
-hyperparameter_grid <- expand_grid(
-  n_lags = c(28),
-  n_external_features = c(ncol(X_external[[1]][[1]])),
-  n_hidden_layers = c(3),
-  lstm_filters = c(64),
-  regularize_lambda = c(0.001),
-  init_filters = c(32),
-  filter_reduction_factor = c(1),
-  init_dropout = c(.1),
-  dropout_reduction_factor = c(2),
-  learning_rate = c(0.001)
-)
+# hardcoded so grid search does not have to be rerun
+best_hyperparameters <- list(
 
-run_4 <- final_fit(list(X_lagged_4, X_external), y_4, hyperparameter_grid[1,] %>% as.list(), lstmnet)
-run_6 <- final_fit(list(X_lagged_6, X_external), y_6, hyperparameter_grid[1,] %>% as.list(), lstmnet)
+    # LSTM hyperparameters
+    lstm_filters = c(64),             # Number of units/filters in the LSTM layer
+
+    # Dense layers for external features
+    n_hidden_layers = c(3),                   # Number of hidden layers for external features
+    init_filters = c(128),                # Number of neurons/filters in the first dense layer
+    filter_reduction_factor = c(2),              # Reduction factor for neurons/filters in subsequent layers
+    init_dropout = c(0.2),                # Initial dropout rate
+    dropout_reduction_factor = c(1),        # Reduction factor for dropout in subsequent layers
+
+    # Regularization
+    regularize_lambda = c(0.1),        # L2 regularization factor for LSTM
+
+    # Model input parameters (fixed)
+    n_lags = c(28),                                 # Number of lagged time series data
+    n_external_features = c(50),                    # Number of external features
+
+    # Model compilation hyperparameters
+    learning_rate = c(0.001)             # Learning rate for optimizer
+)
+```
+
+```{r}
+run <- final_fit(list(X_lagged, X_external), y, best_hyperparameters, lstmnet, "lstmnet")
 
 plot(run[[2]])
 ```
 
 ```{r}
-raster_predict <- final_predict(list(run_4[[1]], run_6[[1]]), analysis_data)
+raster_predict <- final_predict(run[[1]], analysis_data)
 
-(visualize_data %>%
-    ggplot() +
-      geom_line(data = analysis_data, aes(x = date, y = descale_prices(mean_price, full_data), linetype = "dashed", group = beds)) +
-      geom_line(data = raster_predict, aes(x = date, y = descale_prices(mean_price, full_data), color = beds, group = beds)))
-ggsave("test.jpg", width = 10, height = 5)
+final_data <- full_data %>% feature_creation() %>% select(date, mean_price) %>% add_column(type = "actual")
+final_data %<>%  
+  bind_rows(., raster_predict %>% add_column(type = "lstmnet"))
 ```
 
 ## A 1D-Convolutional Neural Network
@@ -637,136 +540,82 @@ source("components/convnet.R")
 convnet <- model
 ```
 
-### Hyperparameter grid search
+### Final model
 
 ```{r}
 hyperparameters_grid <- list(
 
     # 1D Convolution hyperparameters
-    conv_filters = c(16, 32, 64, 128),                 # Number of filters in the convolution
-    conv_kernel_size = c(2, 3, 4, 5),                  # Size of the convolution kernel
-    pool_size = c(2, 3, 4),                            # Max pooling size
-    conv_dense_units = c(32, 64, 128),                 # Dense layer size after 1D-Convolution 
+    conv_filters = c(64),                 # Number of filters in the convolution
+    conv_kernel_size = c(3),                  # Size of the convolution kernel
+    pool_size = c(3),                            # Max pooling size
+    conv_dense_units = c(32),                 # Dense layer size after 1D-Convolution 
 
     # Dense layers for external features
-    n_hidden_layers = c(1, 2, 3),                      # Number of hidden layers for external features
-    init_filters = c(128, 256, 512),                   # Number of neurons/filters in the first dense layer
-    filter_reduction_factor = c(2, 3),                 # Reduction factor for neurons/filters in subsequent layers
-    init_dropout = c(0.1, 0.2, 0.3),                   # Initial dropout rate
-    dropout_reduction_factor = c(1, 1.5, 2),           # Reduction factor for dropout in subsequent layers
+    n_hidden_layers = c(3),                      # Number of hidden layers for external features
+    init_filters = c(128),                   # Number of neurons/filters in the first dense layer
+    filter_reduction_factor = c(2),                 # Reduction factor for neurons/filters in subsequent layers
+    init_dropout = c(0.2),                   # Initial dropout rate
+    dropout_reduction_factor = c(1),           # Reduction factor for dropout in subsequent layers
 
     # Regularization
-    regularize_lambda = c(0.001, 0.01, 0.1),           # L2 regularization factor
+    regularize_lambda = c(0.1),           # L2 regularization factor
 
     # Model input parameters (fixed)
     n_lags = c(28),                                 # Number of lagged time series data
     n_external_features = c(50),                    # Number of external features
 
     # Model compilation hyperparameters
-    learning_rate = c(0.001, 0.01, 0.1),               # Learning rate for optimizer
+    learning_rate = c(0.001)               # Learning rate for optimizer
 
 )
 ```
 
 ```{r}
-# execute grid search, store results
-grid_results <- grid_search(X_external, y, convnet, hyperparameters_grid, 5)
-saveRDS(grid_results, file = "grid_search_external_model.rds")
-```
-
-### Single test
-
-```{r}
-hyperparameter_grid <- expand_grid(
-  n_lags = c(28),
-  n_external_features = c(ncol(X_external[[1]][[1]])),
-  #
-  conv_filters = c(64),
-  conv_kernel_size = c(7),
-  regularize_lambda = c(.001),
-  pool_size = c(2),
-  conv_dense_units = c(64),
-  #
-  n_hidden_layers = c(3),
-  init_filters = c(64),
-  filter_reduction_factor = c(2),
-  init_dropout = c(.3),
-  dropout_reduction_factor = c(2),
-  #
-  learning_rate = c(0.001)
-)
-
-run <- final_fit(list(X_lagged, X_external), y, hyperparameter_grid[1,] %>% as.list(), convnet)
+run <- final_fit(list(X_lagged, X_external), y, hyperparameters_grid, convnet, "convnet")
 
 plot(run[[2]])
 ```
 
 ```{r}
-raster_predict <- final_predict(run[[1]], list(X_lagged, X_external), y, 
-                                list(X_lagged_predict, X_external_predict), raster_predict)
+raster_predict <- final_predict(run[[1]], analysis_data)
 
-visualize_data <-
-  bind_rows(analysis_data %>% add_column(type = "obs"),
-            raster_predict %>% add_column(type = "pred"))
-
-visualize_data %>%
-    ggplot(aes(x = date, y = descale_prices(mean_price, full_data), color = type)) +
-      geom_line()
+final_data %<>%  
+  bind_rows(., raster_predict %>% add_column(type = "convnet"))
 ```
 
-# --- Deprecated stuff ---
+## Descriptives
 
 ```{r}
-# a function to reverse scaling and first-differencing
-reverse_transform <- function(grid, full_data){
-  # a function to scale output   
-  min_max_scale <- function(data, min_val, max_val) {
-    (data - min_val) / (max_val - min_val)
-  } 
-
-  # a function to reverse scaling
-  rev_min_max <- function(data, min_val, max_val){
-    data * (max_val - min_val) + min_val
-  }
-
-  # get the anchor values for reverse scaling
-  tmp <- full_data %>%
-    group_by(date) %>%
-    summarise(mean_price = mean(price), date = unique(date))
-  tmp_min <- tmp$mean_price %>% min(na.rm = T); tmp_max <- tmp$mean_price %>% max(na.rm = T)
-
-  # get the anchor values for reverse first-differencing
-  anchor <- full_data %>% filter(date %within% interval(ymd("2024-06-04"), ymd("2024-06-10"))) %>% 
-    group_by(date) %>%
-    summarise(anchor = mean(price), date = unique(date + 7)) %>%
-    mutate(across(anchor, min_max_scale, min = tmp_min, max = tmp_max))
-
-  grid %>%
-    # add anchor values
-    full_join(anchor, by = "date") %>%
-    mutate(mean_price = ifelse(!is.na(anchor), mean_price + anchor, mean_price)) %>%
-    select(-anchor) %>%
-    # reverse first-differencing
-    group_by(wday(date)) %>%
-    mutate(mean_price = cumsum(mean_price)) %>%
-    ungroup() %>%
-        # reverse scaling
-    mutate(across(mean_price, rev_min_max, min = tmp_min, max = tmp_max))
+get_rmse <- function(data, model){
+  actual <- data %>% filter(date >= "2023-10-01",
+                            date <= "2024-06-09",
+                            type == "actual") %>% 
+              pull(mean_price)
+  predicted <- data %>% filter(date >= "2023-10-01",
+                               date <= "2024-06-09",
+                               type == model)  %>% 
+              pull(mean_price)
+  sqrt(mean((actual - predicted)^2))
 }
+
+get_rmse(final_data, "lstmnet")
+
+get_rmse(final_data, "convnet")
+
+
+final_data %>%
+    filter(date <= max(date[type=="actual"])) %>%
+    ggplot(aes(x = date, y = descale_prices(mean_price, full_data), color = type)) +
+      geom_line() +
+      theme_classic() +
+      theme(text=element_text(family="TT Arial"))
+
+# plot mean daily price over time
+full_data %>%
+    feature_creation() %>%
+    ggplot(aes(x = date, y = mean_price)) +
+      geom_line() +
+      geom_vline(xintercept = public_holidays) +
+      geom_vline(xintercept = ymd(c("2023-03-17", "2023-06-11", "2022-09-13", "2022-12-16")), color = "red")
 ```
-
-```r
-# filter to not include int_overlaps
-full_data %>% filter((dataset == "0922" & date <= "2022-12-16") | 
-                     (dataset == "1222" & date <= "2023-03-17") | 
-                     (dataset == "0323" & date <= "2023-06-11") |
-                     (dataset == "0723"))
-```
-
-
-TODO:
-
-- category
-
-- find sources
-- write essay
