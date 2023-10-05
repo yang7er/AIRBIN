@@ -17,8 +17,7 @@ library("caret")
 library("reticulate")
 library("httr")
 library("jsonlite")
-reticulate::use_condaenv("monash")
-setwd("./Final Project")
+reticulate::use_condaenv("stat_ml")
 ```
 
 ## Data Pre-Preprocessing
@@ -136,29 +135,10 @@ school_holidays <- read_csv("public_holidays.csv", show_col_types = FALSE) %>%
 # create a function that performs feature creation, returning a data frame
 feature_creation <- function(data){
 
-  within_any <- function(date, intervals){
-      map(intervals, ~ date %within% .x)
-  }
-
-  # create several external variables of seasonality
-
+  # create a mean price variable
   data %<>%
-    group_by(date) %>%
-    summarise(mean_price = mean(price, na.rm = TRUE),
-              time = unique(as.double(date)),
-              year = unique(year(date)),
-              month = unique(month(date)),
-              day = unique(day(date)),
-              day_of_year = unique(yday(date)),
-              weekday = unique(wday(date))) %>%
-    # scale year and add linearly scaled time variable
-    mutate(month_scaled = (month - 1) / 11,
-           day_scaled = (day - 1) / 30,
-           weekday_scaled = (weekday - 1) / 6,
-           day_of_year_scaled = (day_of_year - 1) / 364,
-           year_scaled = (year - 2022) / (2025 - 2022),
-           time_scaled = (time - as.double(ymd("20241231"))) /
-                          (as.double(ymd("20241231")) - as.double(ymd("20220101"))))
+    group_by(beds = (beds == 4) * 1, date) %>%
+    summarize(mean_price = mean(price, na.rm = TRUE))
 
   # scaling output   
   min_max_scale <- function(data, feature_range=c(0, 1)) {
@@ -174,25 +154,42 @@ feature_creation <- function(data){
 
   # scale if not all zero (i.e. prediction of future prices)
   if(!all(data$mean_price == 0)) data$mean_price <- min_max_scale(data$mean_price)[[1]]
+
+  # adding lagged outcomes in column
+  eval(parse(text = paste0("data %<>% mutate(", paste("lag(mean_price,", 1:28, ")", collapse = ", ", sep = ""), ")")))
+
+  # create several external variables of seasonality
+  data %<>% 
+    mutate(
+      time = as.double(date),
+      year = year(date),
+      month = month(date),
+      day = day(date),
+      day_of_year = yday(date),
+      weekday = wday(date),
+      month_scaled = (month - 1) / 11,
+      day_scaled = (day - 1) / 30,
+      weekday_scaled = (weekday - 1) / 6,
+      day_of_year_scaled = (day_of_year - 1) / 364,
+      year_scaled = (year - 2022) / (2025 - 2022),
+      time_scaled = (time - as.double(ymd("20241231"))) /
+                    (as.double(ymd("20241231")) - as.double(ymd("20220101"))))
+
+  within_any <- function(date, intervals){
+      map(intervals, ~ date %within% .x)
+  }
   
   # adding holiday information to the data
   data %<>%
-    ungroup() %>%
     mutate(public_holiday = date %in% public_holidays,
            public_holidays = lag(public_holiday, 1) | public_holiday | lead(public_holiday, 1),
-          school_holiday = map_dfc(school_holidays, ~ date %within% .x) %>% mutate(a = pmap(., any)) %>% pull("a") %>% as.logical(),
-          school_holiday = lag(school_holiday, 1) | school_holiday | lead(school_holiday, 1),
-          across(c(month, day, weekday), factor)) %>%
-    drop_na()
+           school_holiday = map_dfc(school_holidays, ~ date %within% .x) %>% mutate(a = pmap(., any)) %>% pull("a") %>% as.logical(),
+           school_holiday = lag(school_holiday, 1) | school_holiday | lead(school_holiday, 1),
+          across(c(month, day, weekday), factor))
 
   # first-order difference of lagged outcome at week level
   #data %<>% 
   #  mutate(across(mean_price, ~ .x - lag(.x, 7)))
-
-  # adding lagged outcomes in column
-  data <- bind_cols(
-    data, 
-      eval(parse(text = paste0("data %>% summarise(", paste("lag(mean_price,", 1:28, ")", collapse = ", ", sep = ""), ")"))))
 
     # One-hot encoding for categorical variables like 'day_of_week' and 'month'
   create_dummy_variables <- function(in_data, factor_col, levels) {
@@ -267,74 +264,47 @@ train_test_val_split <- function(data, k){
 ```
 
 ```{r}
+k_folds <- 3
+
 # filter data, create lagged and calendar features, drop initial NAs
 analysis_data <- full_data %>% 
-  #filter(date < as_date("2023-10-01")) %>% 
+  filter(date < as_date("2023-10-01")) %>% 
+  filter(beds %in% c(4, 6)) %>%
   feature_creation() %>%
   drop_na()
 
-X_select <- analysis_data %>% 
-  select(public_holiday, school_holiday, time_scaled, year_scaled, day_of_year_scaled, weekday2:month12) %>% 
-  as.matrix() %>%
-  train_test_val_split(10)
-
 # get the lagged time series input, split and add dimension
-X_lagged <- analysis_data %>% 
+X_lagged_4 <- analysis_data %>% 
+  filter(beds == 0) %>%
   select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
   as.matrix() %>%
-  train_test_val_split(10) %>%
+  train_test_val_split(k_folds) %>%
+  map(., ~ map(.x, ~ .x %>% `dim<-`(c(dim(.)[1], dim(.)[-1], 1))))
+X_lagged_6 <- analysis_data %>% 
+  filter(beds == 1) %>%
+  select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
+  as.matrix() %>%
+  train_test_val_split(k_folds) %>%
   map(., ~ map(.x, ~ .x %>% `dim<-`(c(dim(.)[1], dim(.)[-1], 1))))
 
 # get the external input, split and add dimension
 X_external <- analysis_data %>% 
+  filter(beds == 0) %>%
   select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
   as.matrix() %>%
-  train_test_val_split(10)
+  train_test_val_split(k_folds)
 
 # get the output data
-y <- analysis_data %>% 
+y_4 <- analysis_data %>% 
+  filter(beds == 0) %>%
   select(mean_price) %>%
-  train_test_val_split(10) %>% 
+  train_test_val_split(k_folds) %>% 
   map(., ~ map(.x, pull))
-```
-
-```{r}
-# a function to generate a sequence of dates
-generate_date_sequence <- function(start_date, end_date, interval) {
-  # Convert input strings to date objects
-  start_date <- as.Date(start_date)
-  end_date <- as.Date(end_date)
-
-  # Create a sequence of dates
-  date_sequence <- seq(start_date, end_date, by = interval)
-
-  return(date_sequence)
-}
-
-# create a data frame with the dates for the prediction period
-raster_predict <- tibble(date = generate_date_sequence("2024-06-08", "2025-03-31", "1 day"), 
-                    price = 0) %>% 
-  feature_creation()
-
-X_select_predict <- raster_predict %>% 
-  select(public_holiday, school_holiday, time_scaled, year_scaled, day_of_year_scaled, weekday2:month12) %>% 
-  as.matrix()
-
-# get the lagged time series input, split and add dimension
-X_lagged_predict <- raster_predict %>% 
-  select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
-  as.matrix() %>% 
-  `dim<-`(c(dim(.)[1], dim(.)[-1], 1))
-
-# get the external input, split and add dimension
-X_external_predict <- raster_predict %>% 
-  select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
-  as.matrix()
-
-# get the output data
-y_predict <- raster_predict %>% 
+y_6 <- analysis_data %>% 
+  filter(beds == 1) %>%
   select(mean_price) %>%
-  pull()
+  train_test_val_split(k_folds) %>% 
+  map(., ~ map(.x, pull))
 ```
 
 ## Descriptives
@@ -354,33 +324,41 @@ full_data %>%
 ```{r}
 # a function implementing hyperparameter grid search
 grid_search <- function(X, y, model, hyperparameter_grid, k){
+  hyperparameter_grid <- expand.grid(hyperparameter_grid)
   print("--- commencing hyperparameter search ---")
   # prepare output grid
-  results <- as.list(rep_len(NA, nrow(hyperparameter_grid)))
+  results <- as.list(rep_len(NA, 10))
   # loop over hyperparameter grid
   for(i in 1:nrow(hyperparameter_grid)){
     print(paste0("*** hyperparameter search: ", i, " of ", nrow(hyperparameter_grid), " ***"))
     # prepare list for results of k folds
-    results[[i]] <- as.list(rep_len(NA, k))
+    results[[i%%(10 + 1)]] <- as.list(rep_len(NA, k))
     # loop over folds
     for(j in 1:k){
       print(paste0("~~~ fold: ", j, " of ", k, " ~~~"))
-      results[[i]][[j]] <- model(hyperparameter_grid[i,] %>% as.list()) %>% 
+      results[[i%%(10 + 1)]][[j]] <- model(hyperparameter_grid[i,] %>% as.list()) %>% 
       fit(
         x = list(timeseries_input = X[[1]][[j]][[1]],
                  external_input = X[[2]][[j]][[1]]),
-        y = y[[j]][[1]],,
+        y = y[[j]][[1]],
         epochs = 100,
         batch_size = 32,
         verbose = 0,
         callbacks = list(
           callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1),
           callback_early_stopping(monitor = "val_loss", patience = 10)),
-        validation_data = list(X[[j]][[2]], y[[j]][[2]])
+        validation_data = list(list(timeseries_input = X[[1]][[j]][[2]],
+                                    external_input = X[[2]][[j]][[2]]), 
+                               y[[j]][[2]])
       )
+      
+    }
+    # store results every 10 iterations
+    if(i%%10==0){
+      saveRDS(results, file = paste0("grid_search/grid_search_lstmnet_", (i%/%10),".rds"))
+      results <- as.list(rep_len(NA, 10))
     }
   }
-  results
 }
 ```
 
@@ -415,18 +393,61 @@ final_fit <- function(X, y, hyperparameter_list, model){
 ```
 
 ```{r}
-final_predict <- function(mod, X, y, X_predict, raster_predict){
-  # initialize with last true values
-  X_predict[[1]][1,,] <- tail(tail(y)[[1]][[3]], 28)
+final_predict <- function(mod, analysis_data, start_date = "2023-10-01", end_date = "2024-09-30"){
 
-  for(i in 1:(nrow(X_lagged_predict) - 1)){
-    #
-    raster_predict$mean_price[[i]] <- mod %>% predict(list(X_predict[[1]][i,,,drop=F], X_predict[[2]][i,,drop=F]), verbose = 0)
-    #
-    X_predict[[1]][i+1,,] <- c(raster_predict$mean_price[[i]], X_predict[[1]][i,1:27,])
+  # a function to generate a sequence of dates
+  generate_date_sequence <- function(start_date, end_date, interval) {
+    # Convert input strings to date objects
+    start_date <- as.Date(start_date)
+    end_date <- as.Date(end_date)
+
+    # Create a sequence of dates
+    date_sequence <- seq(start_date, end_date, by = interval)
+
+    return(date_sequence)
   }
 
-  return(raster_predict)
+  # create a data frame with the dates for the prediction period
+  raster_predict <- expand_grid(date = generate_date_sequence(start_date, end_date, "1 day"), 
+                                price = 0,
+                                beds = c(4, 6)) %>% 
+    feature_creation()
+
+  out <- as.list(rep_len(NA, 2))
+  for(n_beds in 0:1){
+    # get the lagged time series input, split and add dimension
+    X_lagged_predict <- raster_predict %>% 
+      filter(beds == n_beds) %>%
+      select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>% 
+      as.matrix() %>% 
+      `dim<-`(c(dim(.)[1], dim(.)[-1], 1))
+    X_lagged_predict[1,,] <- analysis_data %>% 
+      filter(beds == n_beds, date == (ymd(start_date) - 1)) %>%
+      select(`lag(mean_price, 1)`:`lag(mean_price, 28)`) %>%
+      as.matrix()
+
+    # get the external input, split and add dimension
+    X_external_predict <- raster_predict %>% 
+      filter(beds == n_beds) %>% 
+      select(public_holiday, school_holiday, year_scaled, day2:month12) %>% 
+      as.matrix()
+
+    X_predict <- list(X_lagged_predict, X_external_predict)
+
+    # get the output data
+    y_predict <- raster_predict %>% 
+      filter(beds == n_beds) %>% 
+      select(date, beds, mean_price)
+
+    for(i in 1:(nrow(X_predict[[1]]) - 1)){
+      #
+      y_predict$mean_price[[i]] <- mod[[(n_beds + 1)]] %>% predict(list(X_predict[[1]][i,,,drop=F], X_predict[[2]][i,,drop=F]), verbose = 0)
+      #
+      X_predict[[1]][i+1,,] <- c(y_predict$mean_price[[i]], X_predict[[1]][i,1:27,])
+    }
+    out[[n_beds + 1]] <- y_predict
+  }
+  return(rbindlist(out))
 }
 ```
 
@@ -551,17 +572,17 @@ lstmnet <- model
 hyperparameters_grid <- list(
 
     # LSTM hyperparameters
-    lstm_filters = c(32, 64, 128, 256),             # Number of units/filters in the LSTM layer
+    lstm_filters = c(64, 256),             # Number of units/filters in the LSTM layer
 
     # Dense layers for external features
-    n_hidden_layers = c(1, 2, 3),                   # Number of hidden layers for external features
-    init_filters = c(128, 256, 512),                # Number of neurons/filters in the first dense layer
+    n_hidden_layers = c(1, 3),                   # Number of hidden layers for external features
+    init_filters = c(128, 512),                # Number of neurons/filters in the first dense layer
     filter_reduction_factor = c(2, 3),              # Reduction factor for neurons/filters in subsequent layers
-    init_dropout = c(0.1, 0.2, 0.3),                # Initial dropout rate
-    dropout_reduction_factor = c(1, 1.5, 2),        # Reduction factor for dropout in subsequent layers
+    init_dropout = c(0.1, 0.3),                # Initial dropout rate
+    dropout_reduction_factor = c(1, 2),        # Reduction factor for dropout in subsequent layers
 
     # Regularization
-    regularize_lambda = c(0.001, 0.01, 0.1),        # L2 regularization factor for LSTM
+    regularize_lambda = c(0.001, 0.1),        # L2 regularization factor for LSTM
 
     # Model input parameters (fixed)
     n_lags = c(28),                                 # Number of lagged time series data
@@ -574,8 +595,7 @@ hyperparameters_grid <- list(
 
 ```{r}
 # execute grid search, store results
-grid_results <- grid_search(X_external, y, lstmnet, hyperparameters_grid, 5)
-saveRDS(grid_results, file = "grid_search_external_model.rds")
+grid_search(list(X_lagged, X_external), y, lstmnet, hyperparameters_grid, k_folds)
 ```
 
 ### Single test
@@ -594,21 +614,20 @@ hyperparameter_grid <- expand_grid(
   learning_rate = c(0.001)
 )
 
-run <- final_fit(list(X_lagged, X_external), y, hyperparameter_grid[1,] %>% as.list(), lstmnet)
+run_4 <- final_fit(list(X_lagged_4, X_external), y_4, hyperparameter_grid[1,] %>% as.list(), lstmnet)
+run_6 <- final_fit(list(X_lagged_6, X_external), y_6, hyperparameter_grid[1,] %>% as.list(), lstmnet)
 
 plot(run[[2]])
 ```
 
 ```{r}
-raster_predict <- final_predict(run[[1]], list(X_lagged, X_external), y, 
-                                list(X_lagged_predict, X_external_predict), raster_predict)
+raster_predict <- final_predict(list(run_4[[1]], run_6[[1]]), analysis_data)
 
-visualize_data <-
-  bind_rows(analysis_data %>% add_column(type = "obs"),
-            raster_predict %>% add_column(type = "pred"))
-visualize_data %>%
-    ggplot(aes(x = date, y = descale_prices(mean_price, full_data), color = type)) +
-      geom_line()
+(visualize_data %>%
+    ggplot() +
+      geom_line(data = analysis_data, aes(x = date, y = descale_prices(mean_price, full_data), linetype = "dashed", group = beds)) +
+      geom_line(data = raster_predict, aes(x = date, y = descale_prices(mean_price, full_data), color = beds, group = beds)))
+ggsave("test.jpg", width = 10, height = 5)
 ```
 
 ## A 1D-Convolutional Neural Network
