@@ -1,0 +1,130 @@
+---
+title: "Airbnb Pricing Forecasting in Mornington Peninsula, Melbourne"
+author: "Felix/Jingyi Shi"
+editor: visual
+footer: "Aribnb Pricing Forecast"
+format: 
+  revealjs:
+    transition: convex
+    width: 1280
+    height: 720
+    logo: slide_files/assets/monash-one-line-black-rgb.png
+    theme: dark
+    css: [/slide_files/assets/tachyons-addon.css,/slide_filesassets/custom.css]
+title-slide-attributes:
+    data-background-image: /slide_files/assets/mornington.webp
+    data-background-opacity: "0.8"
+    
+---
+
+```{r, include = FALSE}
+current_file <- knitr::current_input()
+basename <- gsub(".[Rq]md$", "", current_file)
+
+knitr::opts_chunk$set(
+  fig.path = sprintf("images/%s/", basename),
+  fig.width = 6,
+  fig.height = 4,
+  fig.align = "center",
+  fig.retina = 2,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  cache.path = sprintf("cache/%s/", basename)
+)
+
+library("tidyverse")
+library("lubridate")
+library("magrittr")
+library("data.table")
+library("keras")
+library("tensorflow")
+library("RCurl")
+library("caret")
+library("fpp3")
+library(prophet)
+library(patchwork)
+theme_set(theme_bw(base_size = 18))
+```
+
+
+# Introduction{background-image="slide_files/assets/4.jpeg"}
+
+# Database {background-image="slide_files/assets/2.jpeg"}
+
+## Database
+
+Database choice:
+
+- Airbnb pricing data *(website)* 2022-2023.9
+
+- The school holiday *(website)*
+
+- The public holiday *(website)*
+
+Forecast time period:
+
+- We forecast date from ... to ..., it include summer period in 2024
+
+
+# Benchmark Choice{background-image="slide_files/assets/1.jpeg"}
+
+## ETS & ARIMA
+
+At the beginning we tried the ARIMA and ETS but they do not appear well
+
+![](slide_files/assets/Rplot.png){fig-align="center" width="50%"}
+
+We noticed it has strong mixed seasonality and trend, so we try to use the *prophet*
+
+## Prophet
+
+```{r}
+#| echo: false
+data_4 <- read_csv("data_4.csv")
+holidays <- read_csv("holidays.csv")
+```
+
+```{r}
+#| code-fold: true
+# set the prophet model
+prophet_regular <- prophet::prophet(
+  df = data_4,
+  growth = "linear",
+  n.changepoints = 35,
+  changepoint.range = 0.8,
+  yearly.seasonality = "TRUE",
+  weekly.seasonality = "TRUE",
+  seasonality.mode = "additive",
+  seasonality.prior.scale = 10,
+  holidays = holidays,
+  holidays.prior.scale = 10,
+  changepoint.prior.scale = 0.05,
+  mcmc.samples = 0,
+  interval.width = 0.8,
+  uncertainty.samples = 1000,
+  fit = TRUE
+)
+```
+
+
+![](slide_files/assets/prophet.png){fig-align="center" width="50%"}
+
+
+
+
+
+# Method{background-image="slide_files/assets/3.jpeg"}
+
+## Neurak netwook
+
+# Result{background-image="slide_files/assets/6.jpeg"}
+
+## table compare
+
+# Conclusion{background-image="slide_files/assets/7.jpeg"}
+
+## better one 
+
+# Thanks{background-image="slide_files/assets/5.jpeg"}
