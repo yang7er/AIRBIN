@@ -1,0 +1,165 @@
+# --- Deprecated stuff ---
+
+## A linear model
+
+```{r}
+linear_model <- lm(`...52` ~ ., data = bind_cols(X_select[[10]][[1]], y[[10]][[1]]) %>% mutate(across(c(public_holiday, school_holiday, day2:month12), as.factor)))
+
+test <- full_data %>% feature_creation() # %>% filter(date <= ymd("2023-09-01"))
+
+raster_predict <- tibble(date = generate_date_sequence("2023-09-01", "2025-01-31", "1 day"), 
+                    price = 0) %>% 
+    feature_creation()
+
+
+linear_model <- lm(mean_price ~ time_scaled + year + month + weekday + public_holiday + school_holiday, data = test)
+
+
+linear_model <- lm(mean_price ~ month_scaled + weekday_scaled + public_holiday + school_holiday, data = test)
+
+linear_model %>% summary()
+
+raster_predict$mean_price <- linear_model %>% 
+  predict(raster_predict) %>% as.double()
+
+visualize_data <-
+  bind_rows(analysis_data %>% add_column(type = "obs"),
+            raster_predict %>% add_column(type = "pred"))
+
+visualize_data %>%
+    ggplot(aes(x = date, y = mean_price, color = type)) +
+      geom_line()
+```
+
+## A neural network only using external features
+
+```{r}
+# a hyperparameter grid to test
+hyperparameter_grid <- expand_grid(
+  n_hidden_layers = c(1, 3),
+  input_vars = c(ncol(X_select[[1]][[1]])),
+  init_filters = c(32, 64),
+  filter_reduction_factor = c(1, 2),
+  lambda = c(1, .01, 0),
+  init_dropout = c(0.1, 0.2),
+  dropout_reduction_factor = c(1, 2),
+  learning_rate = c(0.1, 0.001, 0.00001),
+)
+
+# execute grid search, store results
+grid_results <- grid_search(X_external, y, model, hyperparameter_grid, 10)
+saveRDS(grid_results, file = "grid_search_external_model.rds")
+
+## evaluate results
+hyperparameter_grid$result <-
+  map_dbl(grid_results, ~ mean(map_dbl(., ~ min(.$metrics$loss))))
+
+# print results
+hyperparameter_grid[order(hyperparameter_grid$result),]
+
+# get best model
+best_model <- model(hyperparameter_grid[which.min(hyperparameter_grid$result),])
+```
+
+```{r}
+hyperparameter_grid <- expand_grid(
+  n_hidden_layers = c(3),
+  input_vars = c(ncol(X_select[[1]][[1]])),
+  init_filters = c(64),
+  filter_reduction_factor = c(2),
+  init_dropout = c(0.1),
+  dropout_reduction_factor = c(1),
+  learning_rate = c(0.001),
+  lambda = c(0.001)
+)
+
+mod <- model(hyperparameter_grid[1,] %>% as.list())
+
+history <- mod %>% 
+  fit(
+    x = tail(X_select, 1)[[1]][[1]],
+    y = tail(y, 1)[[1]][[1]],
+    epochs = 100,
+    batch_size = 32,
+    verbose = 0,
+    callbacks = list(callback_model_checkpoint(filepath = "checkpoints.h5",
+                                  save_best_only = T, save_weights_only= T),
+    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1)),
+    validation_data = list(tail(X_select, 1)[[1]][[2]], tail(y, 1)[[1]][[2]])
+  )
+
+plot(history)
+
+load_model_weights_tf(mod, "checkpoints.h5")
+```
+
+```{r}
+# predict new data
+raster_predict$mean_price <- mod %>% predict(X_select_predict) %>% as.double()
+
+raster_predict
+
+visualize_data <-
+  bind_rows(analysis_data %>% add_column(type = "obs"),
+            raster_predict %>% add_column(type = "pred"))
+
+visualize_data %>%
+    ggplot(aes(x = date, y = mean_price, color = type)) +
+      geom_line()
+```
+
+
+```{r}
+# a function to reverse scaling and first-differencing
+reverse_transform <- function(grid, full_data){
+  # a function to scale output   
+  min_max_scale <- function(data, min_val, max_val) {
+    (data - min_val) / (max_val - min_val)
+  } 
+
+  # a function to reverse scaling
+  rev_min_max <- function(data, min_val, max_val){
+    data * (max_val - min_val) + min_val
+  }
+
+  # get the anchor values for reverse scaling
+  tmp <- full_data %>%
+    group_by(date) %>%
+    summarise(mean_price = mean(price), date = unique(date))
+  tmp_min <- tmp$mean_price %>% min(na.rm = T); tmp_max <- tmp$mean_price %>% max(na.rm = T)
+
+  # get the anchor values for reverse first-differencing
+  anchor <- full_data %>% filter(date %within% interval(ymd("2024-06-04"), ymd("2024-06-10"))) %>% 
+    group_by(date) %>%
+    summarise(anchor = mean(price), date = unique(date + 7)) %>%
+    mutate(across(anchor, min_max_scale, min = tmp_min, max = tmp_max))
+
+  grid %>%
+    # add anchor values
+    full_join(anchor, by = "date") %>%
+    mutate(mean_price = ifelse(!is.na(anchor), mean_price + anchor, mean_price)) %>%
+    select(-anchor) %>%
+    # reverse first-differencing
+    group_by(wday(date)) %>%
+    mutate(mean_price = cumsum(mean_price)) %>%
+    ungroup() %>%
+        # reverse scaling
+    mutate(across(mean_price, rev_min_max, min = tmp_min, max = tmp_max))
+}
+```
+
+```r
+# filter to not include int_overlaps
+full_data %>% filter((dataset == "0922" & date <= "2022-12-16") | 
+                     (dataset == "1222" & date <= "2023-03-17") | 
+                     (dataset == "0323" & date <= "2023-06-11") |
+                     (dataset == "0723"))
+```
+
+
+TODO:
+
+- category
+
+- find sources
+- write essay

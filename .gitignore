@@ -3,4 +3,8 @@
 .RData
 .Ruserdata
 *.zip
+*.h5
+*.jpg
+*.pdf
 apikey.R
+full_data.csv

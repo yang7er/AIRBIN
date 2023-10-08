@@ -599,9 +599,8 @@ get_rmse <- function(data, model){
   sqrt(mean((actual - predicted)^2))
 }
 
-get_rmse(final_data, "lstmnet")
-
-get_rmse(final_data, "convnet")
+list("lstmnet" = get_rmse(final_data, "lstmnet"),
+     "convnet" = get_rmse(final_data, "convnet"))
 
 
 final_data %>%
@@ -610,12 +609,4 @@ final_data %>%
       geom_line() +
       theme_classic() +
       theme(text=element_text(family="TT Arial"))
-
-# plot mean daily price over time
-full_data %>%
-    feature_creation() %>%
-    ggplot(aes(x = date, y = mean_price)) +
-      geom_line() +
-      geom_vline(xintercept = public_holidays) +
-      geom_vline(xintercept = ymd(c("2023-03-17", "2023-06-11", "2022-09-13", "2022-12-16")), color = "red")
 ```
