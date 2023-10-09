@@ -1,16 +1,14 @@
 ---
-title: "Airbnb Pricing Forecasting in Mornington Peninsula, Melbourne"
-author: "Felix/Jingyi Shi"
+title: "Airbnb Pricing Forecasting in Mornington"
+author: "Felix Schulz/Jingyi Shi"
 editor: visual
 footer: "Aribnb Pricing Forecast"
 format: 
   revealjs:
     transition: convex
-    width: 1280
-    height: 720
     scrollable: true
     logo: slide_files/assets/monash-one-line-black-rgb.png
-    theme: dark
+    theme: simple
     css: [/slide_files/assets/tachyons-addon.css,/slide_filesassets/custom.css]
 title-slide-attributes:
     data-background-image: /slide_files/assets/mornington.webp
@@ -58,33 +56,15 @@ theme_set(theme_bw(base_size = 18))
 
 Database choice:
 
--   Airbnb pricing data *(website)* 2022-2023.9
+-   [Airbnb pricing data in Mornington](http://insideairbnb.com/montreal) *2022.09-2023.09*
 
--   The school holiday *(website)*
+-   [The school holiday](https://wovg-community.gateway.prod.api.vic.gov.au/vicgov/v2.0/dates) *2022-2025*
 
--   The public holiday *(website)*
+-   [The public holiday](https://wovg-community.gateway.prod.api.vic.gov.au/vicgov/v2.0/dates) *2022-2025*
 
 Forecast time period:
 
--   We forecast date from ... to ..., it include summer period in 2024
-
--   Airbnb pricing data *(website)* 2022-2023.9
-
--   The school holiday *(website)*
-
--   The public holiday *(website)*
-
--   Airbnb pricing data *(website)* 2022-2023.9
-
--   The school holiday *(website)*
-
--   The public holiday *(website)*
-
--   Airbnb pricing data *(website)* 2022-2023.9
-
--   The school holiday *(website)*
-
--   The public holiday *(website)*
+-   We forecast date from *2023.10 to 2024.09*, it include *summer period* in 2024.
 
 # Benchmark Choice {background-image="slide_files/assets/1.jpeg"}
 
@@ -92,11 +72,13 @@ Forecast time period:
 
 ### ETS & ARIMA
 
-At the beginning we tried the ARIMA and ETS but they do not appear well
+At the beginning we tried the ARIMA and ETS but they do not appear well.
 
 ![](slide_files/assets/Rplot.png){fig-align="center" width="100%"}
 
-We noticed it has strong mixed seasonality and trend, so we try to use the *prophet*
+We noticed it has strong mixed seasonality and trends, so we try to use the advanced time series forecasting model *prophet*.
+
+<br>
 
 ### Prophet
 
@@ -128,25 +110,54 @@ prophet_regular <- prophet::prophet(
 )
 ```
 
-### $$y(t) = g(t) + s(t) + h(t) + \epsilon_t$$
-
-
-```{r}
-#| code-fold: false
-# set future data
-future <- make_future_dataframe(prophet_regular, periods = 365)
-
-# forecast
-forecast <- predict(prophet_regular, future)
-
-prophet::dyplot.prophet(prophet_regular,forecast)
-```
-
-![](slide_files/assets/prophet.png){fig-align="center" width="100%"}
+<br>
 
 ```{r}
 #| echo: false
-holidays %>% select(2,3,4,5) %>% DT::datatable()
+future <- make_future_dataframe(prophet_regular, periods = 365)
+
+forecast <- predict(prophet_regular, future)
+```
+
+<br>
+
+#### Dynamic interaction prediction result
+
+```{r fig.width = 10,fig.height=5,fig.align='center'}
+#| code-fold: true
+dyplot.prophet(prophet_regular, forecast)
+```
+
+
+
+#### Formulas
+
+<br>
+
+##### $$y(t) = g(t) + s(t) + h(t) + \epsilon_t$$
+
+
+<br>
+
+#### The components of Prophet model
+
+```{r fig.width =8,fig.height=8,fig.align='center'}
+#| code-fold: true
+prophet_plot_components(prophet_regular, forecast)
+```
+
+
+<br>
+
+#### Significant variable
+
+```{r}
+#| echo: false
+holidays %>% select(2,3,4,5) %>% 
+  kable(caption = "The Public holiday in VIC",align = "c") %>% 
+  row_spec(0, color = "white", background = "#67F5F0") %>% 
+  kable_styling(bootstrap_options = "striped", font_size = 30) %>% 
+  scroll_box(width = "100%", height = "500px")
 ```
 
 # Method {background-image="slide_files/assets/3.jpeg"}
