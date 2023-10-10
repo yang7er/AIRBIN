@@ -1,15 +1,14 @@
 ---
-title: "Airbnb Pricing Forecasting in Mornington Peninsula, Melbourne"
-author: "Felix/Jingyi Shi"
+title: "Airbnb Pricing Forecasting in Mornington"
+author: "Felix Schulz/Jingyi Shi"
 editor: visual
 footer: "Aribnb Pricing Forecast"
 format: 
   revealjs:
     transition: convex
-    width: 1280
-    height: 720
+    scrollable: true
     logo: slide_files/assets/monash-one-line-black-rgb.png
-    theme: dark
+    theme: simple
     css: [/slide_files/assets/tachyons-addon.css,/slide_filesassets/custom.css]
 title-slide-attributes:
     data-background-image: /slide_files/assets/mornington.webp
@@ -44,6 +43,8 @@ library("caret")
 library("fpp3")
 library(prophet)
 library(patchwork)
+library(DT)
+library(kableExtra)
 theme_set(theme_bw(base_size = 18))
 ```
 
@@ -55,27 +56,31 @@ theme_set(theme_bw(base_size = 18))
 
 Database choice:
 
--   Airbnb pricing data *(website)* 2022-2023.9
+-   [Airbnb pricing data in Mornington](http://insideairbnb.com/montreal) *2022.09-2023.09*
 
--   The school holiday *(website)*
+-   [The school holiday](https://wovg-community.gateway.prod.api.vic.gov.au/vicgov/v2.0/dates) *2022-2025*
 
--   The public holiday *(website)*
+-   [The public holiday](https://wovg-community.gateway.prod.api.vic.gov.au/vicgov/v2.0/dates) *2022-2025*
 
 Forecast time period:
 
--   We forecast date from ... to ..., it include summer period in 2024
+-   We forecast date from *2023.10 to 2024.09*, it include *summer period* in 2024.
 
 # Benchmark Choice {background-image="slide_files/assets/1.jpeg"}
 
-## ETS & ARIMA
+## Benchmark Choice {.scrollable}
 
-At the beginning we tried the ARIMA and ETS but they do not appear well
+### ETS & ARIMA
 
-![](slide_files/assets/Rplot.png){fig-align="center" width="50%"}
+At the beginning we tried the ARIMA and ETS but they do not appear well.
 
-We noticed it has strong mixed seasonality and trend, so we try to use the *prophet*
+![](slide_files/assets/Rplot.png){fig-align="center" width="100%"}
 
-## Prophet
+We noticed it has strong mixed seasonality and trends, so we try to use the advanced time series forecasting model *prophet*.
+
+<br>
+
+### Prophet
 
 ```{r}
 #| echo: false
@@ -107,43 +112,69 @@ prophet_regular <- prophet::prophet(
 )
 ```
 
-![](slide_files/assets/prophet.png){fig-align="center" width="50%"}
+<br>
+
+```{r}
+#| echo: false
+future <- make_future_dataframe(prophet_regular, periods = 365)
+
+forecast <- predict(prophet_regular, future)
+```
+
+<br>
+
+#### Dynamic interaction prediction result
+
+```{r fig.width = 10,fig.height=5,fig.align='center'}
+#| code-fold: true
+dyplot.prophet(prophet_regular, forecast)
+```
 
 # Method {background-image="slide_files/assets/3.jpeg"}
 
 ## Neural Networks
 
-#### Model Architecture and Hyperparameter Tuning
+#### Formulas
+
+<br>
+
+##### $$y(t) = g(t) + s(t) + h(t) + \epsilon_t$$
 
 Based on review articles we decided to explore :
 
--   **LSTM**: LSTMs are ideal for modeling sequences with temporal dependencies, including long-term dependencies and seasonality.
+<br>
+
+#### The components of Prophet model
+
+```{r fig.width =8,fig.height=8,fig.align='center'}
+#| code-fold: true
+prophet_plot_components(prophet_regular, forecast)
+```
+
+
+<br>
+
+#### Significant variable
+
+```{r}
+#| echo: false
+holidays %>% select(2,3,4,5) %>% 
+  kable(caption = "The Public holiday in VIC",align = "c") %>% 
+  row_spec(0, color = "white", background = "#67F5F0") %>% 
+  kable_styling(bootstrap_options = "striped", font_size = 30) %>% 
+  scroll_box(width = "100%", height = "500px")
+```
+
+# Method {background-image="slide_files/assets/3.jpeg"}
 
 -   **1D-Conv**: 1D-Conv models excel at capturing local patterns and detecting features within sequences, identifying short-term fluctuations and patterns
 
--   Implemented a branched approach 
-    - Lagged outcomes and the other branch assesses external information like seasonality and holidays
-    - Combined through a fully connected regression head
+# Result {background-image="slide_files/assets/6.jpeg"}
 
 ## Neural Networks (cont.)
 
-#### Hyperparameter Tuning
+# Conclusion {background-image="slide_files/assets/7.jpeg"}
 
--   To identify the optimal hyperparameters, we conducted a grid search with internal time series cross-validation
+## better one
 
-#### Training and Evaluation
-
--   Optimization over 100 epochs using the Adam optimizer
--   Keras callbacks were utilized for checkpoints, learning rate scheduling, and early stopping
--   Used Mean Squared Error (MSE) as the training loss and Root Mean Squared Error (RMSE) as the evaluation loss
-
-## Result and Conclusion
-
-![](plot_compare.png){height=350 fig-align="center"}
-
-| model | Prophet | LSTMnet | CONVnet |
-|-------|---------|---------|---------|
-| RMSE  | 22.52   | 63.35   | 46.90   |
-
--   Prophet performs the best among the three models
--   Further optimization is likely to improve the performance of a LSTMnet
+# Thanks {background-image="slide_files/assets/5.jpeg"}
