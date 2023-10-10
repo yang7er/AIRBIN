@@ -14,7 +14,6 @@ format:
 title-slide-attributes:
     data-background-image: /slide_files/assets/mornington.webp
     data-background-opacity: "0.8"
-    
 ---
 
 ```{r, include = FALSE}
@@ -48,8 +47,7 @@ library(patchwork)
 theme_set(theme_bw(base_size = 18))
 ```
 
-
-# Introduction{background-image="slide_files/assets/4.jpeg"}
+# Introduction {background-image="slide_files/assets/4.jpeg"}
 
 # Database {background-image="slide_files/assets/2.jpeg"}
 
@@ -57,18 +55,17 @@ theme_set(theme_bw(base_size = 18))
 
 Database choice:
 
-- Airbnb pricing data *(website)* 2022-2023.9
+-   Airbnb pricing data *(website)* 2022-2023.9
 
-- The school holiday *(website)*
+-   The school holiday *(website)*
 
-- The public holiday *(website)*
+-   The public holiday *(website)*
 
 Forecast time period:
 
-- We forecast date from ... to ..., it include summer period in 2024
+-   We forecast date from ... to ..., it include summer period in 2024
 
-
-# Benchmark Choice{background-image="slide_files/assets/1.jpeg"}
+# Benchmark Choice {background-image="slide_files/assets/1.jpeg"}
 
 ## ETS & ARIMA
 
@@ -82,12 +79,14 @@ We noticed it has strong mixed seasonality and trend, so we try to use the *prop
 
 ```{r}
 #| echo: false
+#| eval: false
 data_4 <- read_csv("data_4.csv")
 holidays <- read_csv("holidays.csv")
 ```
 
 ```{r}
 #| code-fold: true
+#| eval: false
 # set the prophet model
 prophet_regular <- prophet::prophet(
   df = data_4,
@@ -108,23 +107,43 @@ prophet_regular <- prophet::prophet(
 )
 ```
 
-
 ![](slide_files/assets/prophet.png){fig-align="center" width="50%"}
 
+# Method {background-image="slide_files/assets/3.jpeg"}
 
+## Neural Networks
 
+#### Model Architecture and Hyperparameter Tuning
 
+Based on review articles we decided to explore :
 
-# Method{background-image="slide_files/assets/3.jpeg"}
+-   **LSTM**: LSTMs are ideal for modeling sequences with temporal dependencies, including long-term dependencies and seasonality.
 
-## Neurak netwook
+-   **1D-Conv**: 1D-Conv models excel at capturing local patterns and detecting features within sequences, identifying short-term fluctuations and patterns
 
-# Result{background-image="slide_files/assets/6.jpeg"}
+-   Implemented a branched approach 
+    - Lagged outcomes and the other branch assesses external information like seasonality and holidays
+    - Combined through a fully connected regression head
 
-## table compare
+## Neural Networks (cont.)
 
-# Conclusion{background-image="slide_files/assets/7.jpeg"}
+#### Hyperparameter Tuning
 
-## better one 
+-   To identify the optimal hyperparameters, we conducted a grid search with internal time series cross-validation
 
-# Thanks{background-image="slide_files/assets/5.jpeg"}
+#### Training and Evaluation
+
+-   Optimization over 100 epochs using the Adam optimizer
+-   Keras callbacks were utilized for checkpoints, learning rate scheduling, and early stopping
+-   Used Mean Squared Error (MSE) as the training loss and Root Mean Squared Error (RMSE) as the evaluation loss
+
+## Result and Conclusion
+
+![](plot_compare.png){height=350 fig-align="center"}
+
+| model | Prophet | LSTMnet | CONVnet |
+|-------|---------|---------|---------|
+| RMSE  | 22.52   | 63.35   | 46.90   |
+
+-   Prophet performs the best among the three models
+-   Further optimization is likely to improve the performance of a LSTMnet
