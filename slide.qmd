@@ -50,6 +50,13 @@ theme_set(theme_bw(base_size = 18))
 
 # Introduction {background-image="slide_files/assets/4.jpeg"}
 
+::: {.notes}
+Hello, I'm Jingyi Shi, and today Felix and I are speaking about Airbnb Pricing Forecasting in Mornington.
+
+To predict the house prices in the summer of 2024, for benchmark model we used prophet, for neural network model we used LSTMnet and CONVnet.
+:::
+
+
 # Database {background-image="slide_files/assets/2.jpeg"}
 
 ## Database
@@ -65,6 +72,12 @@ Database choice:
 Forecast time period:
 
 -   We forecast date from *2023.10 to 2024.09*, it include *summer period* in 2024.
+
+
+::: {.notes}
+The dataset we choose the aribnb house pricing in mornington from Sep 2022 to Oct 2023. And we also add two new dataset, As external sources we incorporate data on public holidays and school holidays from the official API of Victoria. 
+:::
+
 
 # Benchmark Choice {background-image="slide_files/assets/1.jpeg"}
 
@@ -84,14 +97,12 @@ We noticed it has strong mixed seasonality and trends, so we try to use the adva
 
 ```{r}
 #| echo: false
-#| eval: false
 data_4 <- read_csv("data_4.csv")
 holidays <- read_csv("holidays.csv")
 ```
 
 ```{r}
 #| code-fold: true
-#| eval: false
 # set the prophet model
 prophet_regular <- prophet::prophet(
   df = data_4,
@@ -130,17 +141,6 @@ forecast <- predict(prophet_regular, future)
 dyplot.prophet(prophet_regular, forecast)
 ```
 
-# Method {background-image="slide_files/assets/3.jpeg"}
-
-## Neural Networks
-
-#### Formulas
-
-<br>
-
-##### $$y(t) = g(t) + s(t) + h(t) + \epsilon_t$$
-
-Based on review articles we decided to explore :
 
 <br>
 
@@ -151,7 +151,6 @@ Based on review articles we decided to explore :
 prophet_plot_components(prophet_regular, forecast)
 ```
 
-
 <br>
 
 #### Significant variable
@@ -159,22 +158,67 @@ prophet_plot_components(prophet_regular, forecast)
 ```{r}
 #| echo: false
 holidays %>% select(2,3,4,5) %>% 
+  rename("Holiday" = "holiday",
+         "Date" = "date",
+         "Lower Window" = "lower_window",
+         "Upper Window" = "upper_window") %>% 
   kable(caption = "The Public holiday in VIC",align = "c") %>% 
-  row_spec(0, color = "white", background = "#67F5F0") %>% 
+  row_spec(0, color = "black", background = "#84FCFC") %>% 
   kable_styling(bootstrap_options = "striped", font_size = 30) %>% 
   scroll_box(width = "100%", height = "500px")
 ```
 
+::: {.notes}
+For the benchmark model choice, the aribnb pricing data is the time-series data of daily frequency. So we tried to use the arima and ets model, but the result is not well, it can not catch the month seasonality although I have do the seasonal differnece. We notice the data has a mixed month and year seasonality, and strong trend, we try to use advanced time series forecasting model prophet.
+
+Here is the prophet model forecasting result, In the prophet model, we can adjust the yearly and weekly seasonality to true by hand, then it goes back to capturing seasonality in the fit.
+
+In the mixed components chart, we can clearly observe that, as shown in the weekly component chart, house prices start to rise on Thursdays and then level off on weekdays, And as you can see in YEARLY's COMPONENT graph, prices start to rise from October until January when they reach their highest point, after which they fall and level off.
+
+In order to make the model more accurate, we have to consider that on holidays, house prices can rise suddenly, and the rise in house prices affects not just the day of the holiday, but the dates before and after the holiday start to affect it, so I set the window period for the holiday to be the day before the holiday, and two days after the holiday.
+
+Here is the data of holiaday i set
+:::
+
+
 # Method {background-image="slide_files/assets/3.jpeg"}
 
--   **1D-Conv**: 1D-Conv models excel at capturing local patterns and detecting features within sequences, identifying short-term fluctuations and patterns
+## Neural Networks
 
-# Result {background-image="slide_files/assets/6.jpeg"}
+Based on review articles we decided to explore :
+
+-   *LSTM*: LSTMs are ideal for modeling sequences with temporal dependencies, including long-term dependencies and seasonality.
+
+-   *1D-Conv*: 1D-Conv models excel at capturing short-term fluctuations and patterns
+
+-   Implemented a branched approach 
+    - Lagged outcomes and the other branch assesses external information like seasonality and holidays
+    - Combined through a fully connected regression head
 
 ## Neural Networks (cont.)
 
-# Conclusion {background-image="slide_files/assets/7.jpeg"}
+#### Hyperparameter Tuning
 
-## better one
+-   To identify the optimal hyperparameters, we conducted a grid search with internal time series cross-validation
+
+#### Training and Evaluation
+
+-   Optimization over 100 epochs using the Adam optimizer
+-   Keras callbacks were utilized for learning rate scheduling, and early stopping
+-   Used Mean Squared Error (MSE) as the training loss and Root Mean Squared Error (RMSE) as the evaluation loss
+
+
+# Result & Conclusion {background-image="slide_files/assets/7.jpeg"}
+
+## Result & Conclusion
+
+![](slide_files/assets/plot_compare.png){height=350 fig-align="center"}
+
+| model | Prophet | LSTMnet | CONVnet |
+|-------|---------|---------|---------|
+| RMSE  | 22.52   | 63.35   | 46.90   |
+
+-   Prophet performs the best among the three models
+-   Further optimization is likely to improve the performance of a LSTMnet
 
 # Thanks {background-image="slide_files/assets/5.jpeg"}
