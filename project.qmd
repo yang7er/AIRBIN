@@ -1,7 +1,4 @@
 ---
-format: ipynb
-execute: 
-  eval: false
 ---
 
 ```{r}
@@ -19,7 +16,7 @@ library("httr")
 library("jsonlite")
 reticulate::use_condaenv("stat_ml")
 reticulate::py_run_string("import tensorflow as tf")
-reticulate::py_run_string("tf.random.set_seed(1)")
+reticulate::py_run_string("tf.random.set_seed(111)")
 ```
 
 ## Data Pre-Preprocessing
@@ -449,6 +446,7 @@ lstmnet <- model
 ### Hyperparameter grid search
 
 ```{r}
+#| eval: false
 hyperparameters_grid <- list(
 
     # LSTM hyperparameters
@@ -529,6 +527,7 @@ plot(run[[2]])
 raster_predict <- final_predict(run[[1]], analysis_data)
 
 final_data <- full_data %>% feature_creation() %>% select(date, mean_price) %>% add_column(type = "actual")
+
 final_data %<>%  
   bind_rows(., raster_predict %>% add_column(type = "lstmnet"))
 ```
@@ -587,6 +586,16 @@ final_data %<>%
 ## Descriptives
 
 ```{r}
+final_data %<>%
+  mutate(mean_price = descale_prices(mean_price, full_data)) %>%
+  bind_rows(.,
+            read_csv("predictions_prophet.csv") %>%
+              rename(date = ds, mean_price = yhat) %>%
+              add_column(type = "prophet")) %>%
+  filter(!(type == "prophet" & date <= "2023-09-30"))
+```
+
+```{r}
 get_rmse <- function(data, model){
   actual <- data %>% filter(date >= "2023-10-01",
                             date <= "2024-06-09",
@@ -600,13 +609,17 @@ get_rmse <- function(data, model){
 }
 
 list("lstmnet" = get_rmse(final_data, "lstmnet"),
-     "convnet" = get_rmse(final_data, "convnet"))
+     "convnet" = get_rmse(final_data, "convnet"),
+     "prophet" = get_rmse(final_data, "prophet"))
 
 
 final_data %>%
     filter(date <= max(date[type=="actual"])) %>%
-    ggplot(aes(x = date, y = descale_prices(mean_price, full_data), color = type)) +
+    ggplot(aes(x = date, y = mean_price, color = type, alpha = type)) +
       geom_line() +
+      scale_alpha_manual(breaks = c("actual", "convnet", "lstmnet", "prophet"), values = c(.3, .8, .8, .8)) +
+      scale_color_viridis_d() +
       theme_classic() +
       theme(text=element_text(family="TT Arial"))
+ggsave("plot_compare.png", height = 4, width = 10)
 ```

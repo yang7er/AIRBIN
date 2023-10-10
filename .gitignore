@@ -8,3 +8,8 @@
 *.pdf
 apikey.R
 full_data.csv
+calendar*
+listings*
+*.RData
+*.rdb
+*.rdx
